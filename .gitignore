@@ -33,6 +33,9 @@ depend.mk
 *.nav
 *.snm
 *.pdf
+!GPU Pipeline for Accelerated Search of an Upper Bound on the Matrix Multiplication Exponent.pdf
+!paper/
+!paper/2307.06463v1.pdf
 *.toc
 *.cb2
 *.blg
