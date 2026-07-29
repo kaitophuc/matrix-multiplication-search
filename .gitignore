@@ -25,6 +25,7 @@ depend.mk
 *.out
 *.csv
 *.puz
+!data/susp_79_10_candidate.puz
 .log
 ._*
 *.aux
@@ -36,6 +37,7 @@ depend.mk
 !GPU Pipeline for Accelerated Search of an Upper Bound on the Matrix Multiplication Exponent.pdf
 !paper/
 !paper/2307.06463v1.pdf
+!paper/Minh_Phuc_Nguyen_IEEE.pdf
 *.toc
 *.cb2
 *.blg
@@ -61,7 +63,6 @@ workspace/lib/
 .idea/
 lapack/
 puzzles/
-data/
 workspace/build/
 octave-workspace
 .vscode
