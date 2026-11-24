@@ -112,9 +112,9 @@ runtime around it:
 - Adds `GpuTask` slots with pinned input/output buffers and explicit states:
   `Empty`, `Filling`, `Ready`, `Processing`, and `Done`.
 - Gives each OpenMP worker a pool of reusable GPU task slots.
-- Uses `GpuTaskIdQueue` and GPU coordinator threads to move ready batches from
-  CPU workers to CUDA devices.
-- Coalesces multiple task slots into larger GPU launches when dimensions match.
+- Queues ready slot IDs by puzzle dimensions. GPU coordinators share the queues
+  and take a batch from a single size at a time.
+- Drains and retires a size queue when its ILS stage leaves the active window.
 - Supports multiple CUDA devices and multiple coordinator lanes per device.
 - Streams row-replacement candidates directly into GPU slots, avoiding a large
   temporary vector for the `3^k` replacement frontier.
@@ -129,7 +129,7 @@ The enhanced flow is:
 OpenMP worker
   -> generate candidate puzzles
   -> fill pinned GpuTask slot
-  -> enqueue slot id
+  -> enqueue slot id by puzzle size
   -> GPU coordinator coalesces slots
   -> outer_KernelDeviceInput runs CUDA batch
   -> results copied back to pinned buffers
@@ -217,7 +217,7 @@ The enhanced searcher exposes several environment variables for tuning:
 | `ILS_GPU_BATCH_SLOTS` | `32` | Requested number of `GpuTask` slots to coalesce per CUDA launch. |
 | `ILS_GPU_MAX_BATCH_MB` | `512` | Memory cap used to choose maximum puzzles per coalesced launch. |
 | `ILS_GPU_SLOTS_PER_WORKER` | `32` | Reusable pinned task slots owned by each OpenMP worker. |
-| `ILS_GPU_COALESCE_US` | `5000` | How long a coordinator waits for more compatible work before launching. |
+| `ILS_GPU_COALESCE_US` | `5000` | Age at which a partial size-specific batch becomes eligible for a free coordinator. Set to `0` for immediate eligibility. |
 | `ILS_GPU_MOD_BLOCKS_PER_TRIAL` | size-dependent | Blocks per trial for TDM modification kernels, capped at 16. |
 | `ILS_GPU_STREAM_ROW_REPLACEMENTS` | enabled | Stream `3^k` row replacements directly into GPU slots. |
 | `ILS_GPU_DONE_DRAIN_LIMIT` | `4` | Limit on opportunistic completed-slot draining. |

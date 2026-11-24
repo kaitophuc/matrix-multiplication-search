@@ -28,6 +28,7 @@ class ILSStage {
   ~ILSStage();
 
   unsigned int getHeight();
+  unsigned int getWidth() const { return k; }
 
   // Perform one unit of work on this stage.
   bool doWork(check_mode_t mode, bool strong);

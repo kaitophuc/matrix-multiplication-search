@@ -19,33 +19,6 @@ enum class GpuTaskState : unsigned char {
 
 const char* gpuTaskStateName(GpuTaskState state);
 
-class GpuTaskIdQueue {
- public:
-  explicit GpuTaskIdQueue(size_t capacity);
-
-  GpuTaskIdQueue(const GpuTaskIdQueue&) = delete;
-  GpuTaskIdQueue& operator=(const GpuTaskIdQueue&) = delete;
-
-  bool try_push(int value);
-  bool try_pop(int& value);
-  bool empty() const;
-  size_t size_approx() const;
-  size_t capacity() const;
-
- private:
-  struct Cell {
-    std::atomic<size_t> sequence;
-    int value;
-
-    Cell() : sequence(0), value(-1) {}
-  };
-
-  size_t cap;
-  std::unique_ptr<Cell[]> cells;
-  std::atomic<size_t> head;
-  std::atomic<size_t> tail;
-};
-
 struct GPUResult {
   std::vector<int> results;
   GPUResult() = default;
@@ -187,3 +160,6 @@ void solveGpuTask(GpuResources& gpu_resources, const std::string& input_filename
                   const std::string& output_filename);
 
 void solveGpuTaskByHTCondor(GpuTask& task);
+
+// Publish a filled slot to the enhanced searcher's GPU scheduler.
+void submitGpuTask(GpuTask& task);

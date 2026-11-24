@@ -35,7 +35,7 @@
 #include <tuple>
 #include <set>
 #include <cstring>
-#include <deque>
+#include <limits>
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -64,6 +64,7 @@
 #include "canonization.h"
 #include "TDM_cuda_enhanced.h"
 #include "GpuTask.h"
+#include "GpuBatchQueue.h"
 
 using namespace std;
 
@@ -94,13 +95,9 @@ using namespace std;
 using BPPQ = BoundedPuzPriorityQueue;
 using BPMFQ = BoundedPuzMultilevelFeedbackQueue;
 
-/* Global GPU slot queues */
-std::vector<std::unique_ptr<GpuTaskIdQueue>> gpuTaskQueues;
-std::atomic<unsigned int> nextGpuTaskQueue(0);
+/* Global GPU slots and queues */
 std::vector<std::unique_ptr<GpuTask>> gpuTaskSlots;
-std::mutex gpuQueueMutex;
-std::condition_variable gpuQueueCv;
-std::atomic<bool> stopGpuWorker(false);
+std::unique_ptr<GpuBatchQueue> gpuBatchQueue;
 std::atomic<bool> should_checkpoint(false);
 std::atomic<bool> should_exit_after_checkpoint(false);
 
@@ -360,102 +357,37 @@ int choose_gpu_launch_max_trials(int s, int k, int requested_slots) {
   return std::max(TRIALS, std::min(requested_trials, cap_trials));
 }
 
-GpuTask* try_claim_gpu_task(int slot_id) {
-  if (slot_id < 0 || slot_id >= (int) gpuTaskSlots.size() || gpuTaskSlots[slot_id] == nullptr) {
-    return nullptr;
-  }
-
-  GpuTask& task = *gpuTaskSlots[slot_id];
-  if (!task.markProcessing()) {
-    return nullptr;
-  }
-  return &task;
+void submitGpuTask(GpuTask& task) {
+  task.markReady();
+  gpuBatchQueue->submit({static_cast<unsigned>(task.s), static_cast<unsigned>(task.k)},
+                        task.slot_id);
 }
 
-bool try_take_claimed_gpu_task_from_queue(GpuTaskIdQueue& queue, GpuTask*& task) {
-  int slot_id = -1;
-  while (queue.try_pop(slot_id)) {
-    task = try_claim_gpu_task(slot_id);
-    if (task != nullptr) {
-      return true;
-    }
-  }
-
-  task = nullptr;
-  return false;
-}
-
-bool any_gpu_task_queue_has_work() {
-  for (const auto& queue : gpuTaskQueues) {
-    if (queue != nullptr && !queue->empty()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool take_claimed_gpu_task(int preferred_queue_id, std::deque<GpuTask*>& deferred_tasks,
-                           GpuTask*& task) {
-  if (!deferred_tasks.empty()) {
-    task = deferred_tasks.front();
-    deferred_tasks.pop_front();
-    return true;
-  }
-
-  const size_t queue_count = gpuTaskQueues.size();
-  for (size_t attempt = 0; attempt < queue_count; attempt++) {
-    size_t queue_id = ((size_t) preferred_queue_id + attempt) % queue_count;
-    if (gpuTaskQueues[queue_id] == nullptr) {
-      continue;
-    }
-    if (try_take_claimed_gpu_task_from_queue(*gpuTaskQueues[queue_id], task)) {
-      return true;
-    }
-  }
-
-  task = nullptr;
-  return false;
-}
-
-void solve_gpu_task_group(int workerId, int deviceId, GpuResources& gpu_resources,
-                          const std::vector<GpuTask*>& tasks) {
-  if (tasks.empty()) {
-    return;
-  }
-
-  const int s = tasks.front()->s;
-  const int k = tasks.front()->k;
+void solve_gpu_task_group(int workerId, GpuResources& gpu_resources, GpuPuzzleSize size,
+                          const std::vector<int>& slot_ids) {
+  const int s = size.rows;
+  const int k = size.columns;
   const unsigned int entries_per_row = (unsigned int) ceil(k / (double) ELTS_PER_ENTRY);
   const size_t puzzle_entries_per_trial = (size_t) s * entries_per_row;
   int total_trials = 0;
 
-  for (GpuTask* task : tasks) {
-    if (task->s != s || task->k != k) {
-      throw std::logic_error("Coalesced GPU task group contains mixed puzzle dimensions.");
+  for (int id : slot_ids) {
+    auto& task = *gpuTaskSlots[id];
+    if (!task.markProcessing() || task.s != s || task.k != k || task.batch_size <= 0) {
+      throw std::logic_error("Invalid task in GPU size queue");
     }
-    if (task->batch_size <= 0) {
-      throw std::logic_error("Coalesced GPU task group contains an empty task.");
-    }
-    total_trials += task->batch_size;
+    total_trials += task.batch_size;
   }
-
   if (total_trials > gpu_resources.max_trials) {
-    throw std::logic_error("Coalesced GPU task group exceeds GpuResources capacity.");
-  }
-
-  if (deviceId >= 0) {
-    cudaError_t set_status = cudaSetDevice(deviceId);
-    if (set_status != cudaSuccess) {
-      throw std::runtime_error(std::string("cudaSetDevice failed before coalesced task copy: ") +
-                               cudaGetErrorString(set_status));
-    }
+    throw std::logic_error("Coalesced GPU task group exceeds GpuResources capacity");
   }
 
   size_t puzzle_offset = 0;
-  for (GpuTask* task : tasks) {
-    size_t task_entries = puzzle_entries_per_trial * (size_t) task->batch_size;
+  for (int id : slot_ids) {
+    const auto& task = *gpuTaskSlots[id];
+    size_t task_entries = puzzle_entries_per_trial * (size_t) task.batch_size;
     cudaError_t copy_status = cudaMemcpyAsync(
-        gpu_resources.dev_Puz + puzzle_offset, task->puz_pinned_buffer,
+        gpu_resources.dev_Puz + puzzle_offset, task.puz_pinned_buffer,
         task_entries * sizeof(e_type), cudaMemcpyHostToDevice, gpu_resources.stream);
     if (copy_status != cudaSuccess) {
       throw std::runtime_error(std::string("cudaMemcpyAsync failed for coalesced GPU task copy: ") +
@@ -466,109 +398,54 @@ void solve_gpu_task_group(int workerId, int deviceId, GpuResources& gpu_resource
 
   outer_KernelDeviceInput(gpu_resources, gpu_resources.results_pinned_buffer, s, k, total_trials);
 
-  if (workerId >= 0 && workerId < (int) gpuLaunchesCompletedByWorker.size()) {
-    gpuLaunchesCompletedByWorker[workerId]++;
+  int result_offset = 0;
+  for (int id : slot_ids) {
+    auto& task = *gpuTaskSlots[id];
+    memcpy(task.results_pinned_buffer, gpu_resources.results_pinned_buffer + result_offset,
+           (size_t) task.batch_size * sizeof(int));
+    result_offset += task.batch_size;
   }
 
-  int result_offset = 0;
-  for (GpuTask* task : tasks) {
-    memcpy(task->results_pinned_buffer, gpu_resources.results_pinned_buffer + result_offset,
-           (size_t) task->batch_size * sizeof(int));
-    result_offset += task->batch_size;
-    task->markDone();
+  gpuLaunchesCompletedByWorker[workerId]++;
+  gpuBatchesCompletedByWorker[workerId] += slot_ids.size();
+  gpuPuzzlesCompletedByWorker[workerId] += total_trials;
 
-    if (workerId >= 0 && workerId < (int) gpuBatchesCompletedByWorker.size()) {
-      gpuBatchesCompletedByWorker[workerId]++;
-      gpuPuzzlesCompletedByWorker[workerId] += (unsigned long long) task->batch_size;
-    }
+  // Account for the copied results before a producer can consume the last slot and advance stages.
+  gpuBatchQueue->complete(size, slot_ids.size(), total_trials);
+  for (int id : slot_ids) {
+    gpuTaskSlots[id]->markDone();
   }
 }
 
-void gpuCoordinator(int queueId, int deviceId, GpuResources& gpu_resources) {
-  cudaSetDevice(deviceId);
-  enhanced_Hcheck_cuda_error("Starting GPU coordinator " + std::to_string(deviceId));
+void gpuCoordinator(int workerId, GpuResources& gpu_resources) {
+  cudaSetDevice(gpu_resources.device_id);
+  enhanced_Hcheck_cuda_error("Starting GPU coordinator " + std::to_string(gpu_resources.device_id));
 
   cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
   enhanced_Hcheck_cuda_error("Setting cache config");
 
-  std::deque<GpuTask*> deferred_tasks;
-
-  while (true) {
-    GpuTask* first_task = nullptr;
-    if (!take_claimed_gpu_task(queueId, deferred_tasks, first_task)) {
-      if (stopGpuWorker.load(std::memory_order_acquire) && !any_gpu_task_queue_has_work()) {
-        break;
-      }
-
-      std::unique_lock<std::mutex> lock(gpuQueueMutex);
-      gpuQueueCv.wait(lock, [&] {
-        return stopGpuWorker.load(std::memory_order_acquire) || any_gpu_task_queue_has_work() ||
-               !deferred_tasks.empty();
-      });
-      continue;
-    }
-
-    std::vector<GpuTask*> tasks;
-    tasks.reserve((size_t) gpuLaunchSlotBatch);
-    tasks.push_back(first_task);
-
-    int total_trials = first_task->batch_size;
-    const int group_s = first_task->s;
-    const int group_k = first_task->k;
-    auto coalesce_deadline =
-        std::chrono::steady_clock::now() + std::chrono::microseconds(gpuCoalesceWaitUs);
-
-    while ((int) tasks.size() < gpuLaunchSlotBatch && total_trials < gpu_resources.max_trials) {
-      GpuTask* next_task = nullptr;
-      if (!take_claimed_gpu_task(queueId, deferred_tasks, next_task)) {
-        if (gpuCoalesceWaitUs <= 0 || stopGpuWorker.load(std::memory_order_acquire) ||
-            std::chrono::steady_clock::now() >= coalesce_deadline) {
-          break;
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-        continue;
-      }
-
-      if (next_task->s != group_s || next_task->k != group_k ||
-          total_trials + next_task->batch_size > gpu_resources.max_trials) {
-        deferred_tasks.push_front(next_task);
-        break;
-      }
-
-      tasks.push_back(next_task);
-      total_trials += next_task->batch_size;
-    }
-
-    solve_gpu_task_group(queueId, deviceId, gpu_resources, tasks);
-    if (any_gpu_task_queue_has_work()) {
-      gpuQueueCv.notify_all();
-    }
+  std::vector<int> slot_ids;
+  GpuPuzzleSize size{};
+  while (gpuBatchQueue->take(size, slot_ids)) {
+    solve_gpu_task_group(workerId, gpu_resources, size, slot_ids);
   }
 }
 
-void initializeGpuTaskSlots(int cpu_workers, int s_target, int k, int slots_per_worker,
-                            int queue_count) {
-  gpuSlotsPerWorker = std::max(2, slots_per_worker);
-  int slot_count = std::max(1, cpu_workers) * gpuSlotsPerWorker;
+void initializeGpuTaskSlots(int cpu_workers, int s_target, int k, int slots_per_worker) {
+  int slot_count = std::max(1, cpu_workers) * slots_per_worker;
   gpuTaskSlots.clear();
   gpuTaskSlots.reserve(slot_count);
   for (int slot_id = 0; slot_id < slot_count; slot_id++) {
-    int owner_worker_id = slot_id / gpuSlotsPerWorker;
     auto slot = std::make_unique<GpuTask>();
-    slot->allocatePinned(s_target, k, TRIALS, slot_id, owner_worker_id);
+    slot->allocatePinned(s_target, k, TRIALS, slot_id, slot_id / slots_per_worker);
     gpuTaskSlots.push_back(std::move(slot));
   }
-  gpuTaskQueues.clear();
-  gpuTaskQueues.reserve((size_t) queue_count);
-  for (int queue_id = 0; queue_id < std::max(1, queue_count); queue_id++) {
-    gpuTaskQueues.push_back(std::make_unique<GpuTaskIdQueue>((size_t) slot_count));
-  }
-  nextGpuTaskQueue.store(0, std::memory_order_release);
+  gpuBatchQueue = std::make_unique<GpuBatchQueue>(slot_count, gpuLaunchSlotBatch,
+                                                  std::chrono::microseconds(gpuCoalesceWaitUs));
 }
 
 void cleanupGpuPipeline() {
-  stopGpuWorker.store(true, std::memory_order_release);
-  gpuQueueCv.notify_all();
+  gpuBatchQueue->stop();
 
   for (std::thread& coordinator : gpuCoordinatorThreads) {
     if (coordinator.joinable()) {
@@ -607,7 +484,8 @@ void cleanupGpuPipeline() {
          << avg_puzzles_per_launch << " puzzles/launch)." << '\n';
   }
 
-  gpuTaskQueues.clear();
+  gpuBatchQueue->setActiveSizes({}, cout);
+  gpuBatchQueue.reset();
   gpuTaskSlots.clear();
 
   for (auto& resources : gpu_resources) {
@@ -740,6 +618,15 @@ bool search_ils(bool is_resume = false) {
   }
 
   for (; g_search.s <= g_search.s_target; g_search.s++) {
+    // The preceding OpenMP region drains its slots before the stage window moves.
+    std::vector<GpuPuzzleSize> active_sizes;
+    active_sizes.reserve(g_search.stages.size());
+    for (const auto& stage : g_search.stages) {
+      if (stage) {
+        active_sizes.push_back({stage->getHeight(), stage->getWidth()});
+      }
+    }
+    gpuBatchQueue->setActiveSizes(active_sizes, cout);
     cout << "\n>>>>>>>> NEW STAGE (s = " << g_search.s << ") <<<<<<<<<\n" << '\n';
 
     Puz* result = nullptr;
@@ -1050,7 +937,9 @@ int main(int argc, char* argv[]) {
   gpuLaunchSlotBatch = std::max(1, gpuLaunchMaxTrials / TRIALS);
   gpuSlotsPerWorker = parse_positive_env("ILS_GPU_SLOTS_PER_WORKER", 32);
   gpuSlotsPerWorker = std::max(2, gpuSlotsPerWorker);
-  gpuCoalesceWaitUs = parse_positive_env("ILS_GPU_COALESCE_US", 5000);
+  gpuCoalesceWaitUs = static_cast<int>(std::min(
+      parse_nonnegative_env("ILS_GPU_COALESCE_US", 5000),
+      static_cast<long long>(std::numeric_limits<int>::max())));
   cout << "GPU launch coalescing: up to " << gpuLaunchSlotBatch << " task slots ("
        << gpuLaunchMaxTrials << " puzzles) per CUDA launch." << '\n';
   cout << "GPU task buffering: " << gpuSlotsPerWorker << " slots per CPU worker." << '\n';
@@ -1067,16 +956,13 @@ int main(int argc, char* argv[]) {
                                                       gpuLaunchMaxTrials);
   }
 
-  initializeGpuTaskSlots(omp_get_max_threads(), g_search.s_target, g_search.k, gpuSlotsPerWorker,
-                         numGpuWorkers);
-  stopGpuWorker.store(false, std::memory_order_release);
+  initializeGpuTaskSlots(omp_get_max_threads(), g_search.s_target, g_search.k, gpuSlotsPerWorker);
   gpuLaunchesCompletedByWorker.assign(numGpuWorkers, 0);
   gpuBatchesCompletedByWorker.assign(numGpuWorkers, 0);
   gpuPuzzlesCompletedByWorker.assign(numGpuWorkers, 0);
   gpuCoordinatorThreads.reserve(numGpuWorkers);
   for (int i = 0; i < numGpuWorkers; i++) {
-    gpuCoordinatorThreads.emplace_back(gpuCoordinator, i, gpu_resources[i]->device_id,
-                                       std::ref(*gpu_resources[i]));
+    gpuCoordinatorThreads.emplace_back(gpuCoordinator, i, std::ref(*gpu_resources[i]));
   }
 
   g_auto_checkpoint_interval = std::chrono::seconds(
@@ -1091,6 +977,9 @@ int main(int argc, char* argv[]) {
 
   bool completed = search_ils(is_resume);
   if (!completed) {
+    if (gpuBatchQueue) {
+      cleanupGpuPipeline();
+    }
     return 0;
   }
   bool check = g_search.p.checkPuz(g_search.mode, g_search.strong);

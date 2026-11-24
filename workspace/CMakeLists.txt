@@ -53,3 +53,15 @@ set_target_properties(nauty PROPERTIES
 )
 
 add_subdirectory(src)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(gpu_batch_queue_test
+    tests/gpu_batch_queue_test.cpp
+    src/backend/GpuBatchQueue.cpp
+  )
+  target_include_directories(gpu_batch_queue_test PRIVATE src/backend/includes)
+  target_link_libraries(gpu_batch_queue_test PRIVATE Threads::Threads)
+  add_test(NAME gpu_batch_queue COMMAND gpu_batch_queue_test)
+  set_tests_properties(gpu_batch_queue PROPERTIES TIMEOUT 15)
+endif()

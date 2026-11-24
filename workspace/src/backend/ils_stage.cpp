@@ -43,11 +43,7 @@
 
 using namespace std;
 
-extern std::vector<std::unique_ptr<GpuTaskIdQueue> > gpuTaskQueues;
-extern std::atomic<unsigned int> nextGpuTaskQueue;
 extern std::vector<std::unique_ptr<GpuTask> > gpuTaskSlots;
-extern std::mutex gpuQueueMutex;
-extern std::condition_variable gpuQueueCv;
 extern int gpuSlotsPerWorker;
 
 namespace {
@@ -167,7 +163,7 @@ void ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, check_mode_t mode, bool
   if (num <= 0 || puzzles.empty())
     return;
 
-  if (gpuTaskQueues.empty() || gpuTaskSlots.empty()) {
+  if (gpuTaskSlots.empty()) {
     throw std::runtime_error("GPU task slots are not initialized.");
   }
 
@@ -178,12 +174,6 @@ void ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, check_mode_t mode, bool
   if (last_slot_id > (int) gpuTaskSlots.size()) {
     throw std::runtime_error("OpenMP worker does not have GPU task slots.");
   }
-  vector<int> slot_ids;
-  slot_ids.reserve((size_t) slots_per_worker);
-  for (int slot_id = first_slot_id; slot_id < last_slot_id; slot_id++) {
-    slot_ids.push_back(slot_id);
-  }
-
   int outstanding = 0;
   bool stop_processing = false;
 
@@ -215,7 +205,7 @@ void ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, check_mode_t mode, bool
   auto process_done_slots = [&](int max_slots) {
     bool progressed = false;
     int processed = 0;
-    for (int slot_id : slot_ids) {
+    for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
       if (max_slots > 0 && processed >= max_slots) {
         break;
       }
@@ -241,7 +231,7 @@ void ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, check_mode_t mode, bool
   };
 
   auto wait_for_slot_progress = [&]() {
-    for (int slot_id : slot_ids) {
+    for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
       GpuTask& slot = *gpuTaskSlots[slot_id];
       GpuTaskState state = slot.getState();
       if (state == GpuTaskState::Ready || state == GpuTaskState::Processing) {
@@ -263,7 +253,7 @@ void ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, check_mode_t mode, bool
         return nullptr;
       }
 
-      for (int slot_id : slot_ids) {
+      for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
         GpuTask& slot = *gpuTaskSlots[slot_id];
         if (slot.tryBeginFilling(worker_id, s, k, q_prior, gap, (int) type)) {
           return &slot;
@@ -271,7 +261,7 @@ void ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, check_mode_t mode, bool
       }
 
       bool drained_slot = false;
-      for (int slot_id : slot_ids) {
+      for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
         GpuTask& slot = *gpuTaskSlots[slot_id];
         if (slot.getState() == GpuTaskState::Done) {
           process_done_slot(slot);
@@ -287,25 +277,6 @@ void ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, check_mode_t mode, bool
     }
   };
 
-  auto submit_slot = [&](GpuTask& slot) {
-    slot.markReady();
-    const size_t queue_count = gpuTaskQueues.size();
-    size_t queue_id =
-        nextGpuTaskQueue.fetch_add(1, std::memory_order_acq_rel) % queue_count;
-    while (true) {
-      for (size_t attempt = 0; attempt < queue_count; attempt++) {
-        GpuTaskIdQueue& queue = *gpuTaskQueues[(queue_id + attempt) % queue_count];
-        if (queue.try_push(slot.slot_id)) {
-          outstanding++;
-          gpuQueueCv.notify_all();
-          return;
-        }
-      }
-      process_some_done_slots();
-      std::this_thread::yield();
-    }
-  };
-
   for (size_t next = 0; next < puzzles.size() && !stop_processing;) {
     GpuTask* slot = acquire_slot();
     if (slot == nullptr) {
@@ -315,7 +286,8 @@ void ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, check_mode_t mode, bool
     for (size_t i = 0; i < batch; i++) {
       slot->appendPuzzle(std::move(puzzles[next + i]));
     }
-    submit_slot(*slot);
+    submitGpuTask(*slot);
+    outstanding++;
     next += batch;
   }
 
@@ -335,7 +307,7 @@ void ILSStage::expand_frontier_GPU_row_replacements(const Puz& base, int row_to_
     return;
   }
 
-  if (gpuTaskQueues.empty() || gpuTaskSlots.empty()) {
+  if (gpuTaskSlots.empty()) {
     throw std::runtime_error("GPU task slots are not initialized.");
   }
 
@@ -345,12 +317,6 @@ void ILSStage::expand_frontier_GPU_row_replacements(const Puz& base, int row_to_
   int last_slot_id = first_slot_id + slots_per_worker;
   if (last_slot_id > (int) gpuTaskSlots.size()) {
     throw std::runtime_error("OpenMP worker does not have GPU task slots.");
-  }
-
-  vector<int> slot_ids;
-  slot_ids.reserve((size_t) slots_per_worker);
-  for (int slot_id = first_slot_id; slot_id < last_slot_id; slot_id++) {
-    slot_ids.push_back(slot_id);
   }
 
   int outstanding = 0;
@@ -384,7 +350,7 @@ void ILSStage::expand_frontier_GPU_row_replacements(const Puz& base, int row_to_
   auto process_done_slots = [&](int max_slots) {
     bool progressed = false;
     int processed = 0;
-    for (int slot_id : slot_ids) {
+    for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
       if (max_slots > 0 && processed >= max_slots) {
         break;
       }
@@ -410,7 +376,7 @@ void ILSStage::expand_frontier_GPU_row_replacements(const Puz& base, int row_to_
   };
 
   auto wait_for_slot_progress = [&]() {
-    for (int slot_id : slot_ids) {
+    for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
       GpuTask& slot = *gpuTaskSlots[slot_id];
       GpuTaskState state = slot.getState();
       if (state == GpuTaskState::Ready || state == GpuTaskState::Processing) {
@@ -432,7 +398,7 @@ void ILSStage::expand_frontier_GPU_row_replacements(const Puz& base, int row_to_
         return nullptr;
       }
 
-      for (int slot_id : slot_ids) {
+      for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
         GpuTask& slot = *gpuTaskSlots[slot_id];
         if (slot.tryBeginFilling(worker_id, s, k, q_prior, gap, (int) type)) {
           return &slot;
@@ -440,7 +406,7 @@ void ILSStage::expand_frontier_GPU_row_replacements(const Puz& base, int row_to_
       }
 
       bool drained_slot = false;
-      for (int slot_id : slot_ids) {
+      for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
         GpuTask& slot = *gpuTaskSlots[slot_id];
         if (slot.getState() == GpuTaskState::Done) {
           process_done_slot(slot);
@@ -456,29 +422,11 @@ void ILSStage::expand_frontier_GPU_row_replacements(const Puz& base, int row_to_
     }
   };
 
-  auto submit_slot = [&](GpuTask& slot) {
-    slot.markReady();
-    const size_t queue_count = gpuTaskQueues.size();
-    size_t queue_id =
-        nextGpuTaskQueue.fetch_add(1, std::memory_order_acq_rel) % queue_count;
-    while (true) {
-      for (size_t attempt = 0; attempt < queue_count; attempt++) {
-        GpuTaskIdQueue& queue = *gpuTaskQueues[(queue_id + attempt) % queue_count];
-        if (queue.try_push(slot.slot_id)) {
-          outstanding++;
-          gpuQueueCv.notify_all();
-          return;
-        }
-      }
-      process_some_done_slots();
-      std::this_thread::yield();
-    }
-  };
-
   GpuTask* current_slot = nullptr;
   auto flush_current_slot = [&]() {
     if (current_slot != nullptr && current_slot->batch_size > 0) {
-      submit_slot(*current_slot);
+      submitGpuTask(*current_slot);
+      outstanding++;
       current_slot = nullptr;
     }
   };

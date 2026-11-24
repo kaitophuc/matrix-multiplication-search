@@ -1,5 +1,6 @@
 set(MATMULT_BACKEND_SOURCES
   3DM_to_SAT.cpp
+  GpuBatchQueue.cpp
   GpuTask.cpp
   Permutation.cpp
   Puz.cpp
