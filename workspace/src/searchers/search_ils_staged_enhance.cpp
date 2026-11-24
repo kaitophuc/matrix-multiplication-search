@@ -341,8 +341,8 @@ bool find_auto_start_checkpoint(check_mode_t requested_mode, bool requested_stro
 size_t gpu_bytes_per_trial(int s, int k) {
   const unsigned int entries_per_row = (unsigned int) ceil(k / (double) ELTS_PER_ENTRY);
   return sizeof(e_type) * (size_t) s * entries_per_row +
-         sizeof(uint8_t) * (size_t) s * (size_t) s * (size_t) s + sizeof(int) + sizeof(int) +
-         sizeof(int) * (size_t) s + sizeof(int) + sizeof(uint8_t) * (size_t) s * (size_t) s;
+         GpuResources::tdm_bytes_per_trial(s, k) + 3 * sizeof(int) +
+         sizeof(int) * (size_t) s + sizeof(int) + GpuResources::projection_bytes_per_trial(s, k);
 }
 
 int choose_gpu_launch_max_trials(int s, int k, int requested_slots) {
@@ -396,13 +396,23 @@ void solve_gpu_task_group(int workerId, GpuResources& gpu_resources, GpuPuzzleSi
     puzzle_offset += task_entries;
   }
 
-  outer_KernelDeviceInput(gpu_resources, gpu_resources.results_pinned_buffer, s, k, total_trials);
+  const GpuPairCheck pair_check =
+      g_search.mode == CHECK_FULL ? GpuPairCheck::Disabled
+      : g_search.mode == CHECK_LOCAL ? GpuPairCheck::Local : GpuPairCheck::Obvious;
+  outer_KernelDeviceInput(gpu_resources, gpu_resources.results_pinned_buffer, s, k, total_trials,
+                         pair_check);
 
   int result_offset = 0;
   for (int id : slot_ids) {
     auto& task = *gpuTaskSlots[id];
     memcpy(task.results_pinned_buffer, gpu_resources.results_pinned_buffer + result_offset,
            (size_t) task.batch_size * sizeof(int));
+    if (pair_check != GpuPairCheck::Disabled) {
+      memcpy(task.pair_failures_pinned_buffer,
+             gpu_resources.pair_failures_pinned_buffer + result_offset,
+             (size_t) task.batch_size * sizeof(int));
+      task.pair_failures_ready = true;
+    }
     result_offset += task.batch_size;
   }
 
@@ -953,7 +963,7 @@ int main(int argc, char* argv[]) {
     enhanced_Hcheck_cuda_error("Setting CUDA device" + std::to_string(device_id));
 
     gpu_resources[i] = std::make_unique<GpuResources>(device_id, g_search.s_target, g_search.k,
-                                                      gpuLaunchMaxTrials);
+                                                     gpuLaunchMaxTrials, /*fixed_width=*/true);
   }
 
   initializeGpuTaskSlots(omp_get_max_threads(), g_search.s_target, g_search.k, gpuSlotsPerWorker);

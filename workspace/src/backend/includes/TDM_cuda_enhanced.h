@@ -65,11 +65,14 @@ using e_type = unsigned long long;  // Assuming e_type for clarity
 
 struct GpuResources;
 
+enum class GpuPairCheck { Disabled, Obvious, Local };
+
 void outer_Kernel(GpuResources& gpu_resources, int s, int k, int trials = TRIALS);
 void outer_Kernel(GpuResources& gpu_resources, const e_type* puz_pinned_buffer,
                   int* results_pinned_buffer, int s, int k, int trials = TRIALS);
 void outer_KernelDeviceInput(GpuResources& gpu_resources, int* results_pinned_buffer,
-                             int s, int k, int trials = TRIALS);
+                             int s, int k, int trials = TRIALS,
+                             GpuPairCheck pair_check = GpuPairCheck::Disabled);
 bool check_size(vector<Puz>& puzzles);
 
 __device__ inline void enhanced_check_cuda_error(const char* c = "default") {
@@ -98,6 +101,7 @@ struct GpuResources {
   cudaStream_t stream;
   e_type* puz_pinned_buffer;
   int* results_pinned_buffer;
+  int* pair_failures_pinned_buffer;
 
   char* dev_buf;
   size_t size_buf;
@@ -105,6 +109,7 @@ struct GpuResources {
   e_type* dev_Puz;
   uint8_t* dev_TDM;
   int* dev_result;
+  int* dev_pair_failures;
   int* dev_no_change;
   int* dev_ranges;
   int* dev_active_count;
@@ -114,20 +119,43 @@ struct GpuResources {
   size_t size_TDM, size_Puz, size_result, size_no_change, size_ranges, size_active_count, size_changed,
       size_projection, size;
 
-  GpuResources(int dev_id, int s, int k, int trials) : device_id(dev_id), max_trials(trials) {
+  static bool uses_packed_tdm(int s, int k) {
+    return s > 32 && s <= 64 && k > 0 && k <= 16;
+  }
+
+  static size_t tdm_bytes_per_trial(int s, int k) {
+    const size_t plane = static_cast<size_t>(s) * s;
+    if (uses_packed_tdm(s, k)) {
+      // A search can still have smaller stages that use the byte layout.
+      return std::max(plane * sizeof(uint64_t), size_t{32} * 32 * 32);
+    }
+    return plane * s;
+  }
+
+  static size_t projection_bytes_per_trial(int s, int k) {
+    if (uses_packed_tdm(s, k)) {
+      // Packed projection rows also hold the SCC masks.
+      return std::max(static_cast<size_t>(s) * sizeof(uint64_t), size_t{32} * 32);
+    }
+    return static_cast<size_t>(s) * s;
+  }
+
+  GpuResources(int dev_id, int s, int k, int trials, bool fixed_width = false)
+      : device_id(dev_id), max_trials(trials) {
     cudaSetDevice(device_id);
     enhanced_Hcheck_cuda_error("Setting CUDA device");
 
     unsigned int entries_per_row = (unsigned int) ceil(k / (double) ELTS_PER_ENTRY);
 
-    size_TDM = sizeof(uint8_t) * s * s * s * trials;
+    const size_t plane = static_cast<size_t>(s) * s;
+    size_TDM = (fixed_width ? tdm_bytes_per_trial(s, k) : plane * s) * trials;
     size_Puz = sizeof(e_type) * s * entries_per_row * trials;
     size_result = sizeof(int) * trials;
     size_no_change = sizeof(int) * trials;
     size_ranges = sizeof(int) * s * trials;
     size_active_count = sizeof(int);
     size_changed = sizeof(int) * trials;
-    size_projection = sizeof(uint8_t) * s * s * trials;
+    size_projection = (fixed_width ? projection_bytes_per_trial(s, k) : plane) * trials;
 
     size_TDM = (size_TDM + 7) & ~7;
     size_Puz = (size_Puz + 7) & ~7;
@@ -138,7 +166,7 @@ struct GpuResources {
     size_changed = (size_changed + 7) & ~7;
     size_projection = (size_projection + 7) & ~7;
 
-    size = size_Puz + size_TDM + size_result + size_no_change + size_ranges + size_active_count +
+    size = size_Puz + size_TDM + 2 * size_result + size_no_change + size_ranges + size_active_count +
            size_changed + size_projection;
     size_t offset = 0;
 
@@ -151,6 +179,7 @@ struct GpuResources {
     // Allocate pinned host memory
     cudaMallocHost(&puz_pinned_buffer, size_Puz);
     cudaMallocHost(&results_pinned_buffer, size_result);
+    cudaMallocHost(&pair_failures_pinned_buffer, size_result);
     enhanced_Hcheck_cuda_error("Allocating pinned host memory");
 
     // Allocate device memory
@@ -160,6 +189,8 @@ struct GpuResources {
     dev_Puz = (e_type*) (dev_buf + offset);
     offset += size_Puz;
     dev_result = (int*) (dev_buf + offset);
+    offset += size_result;
+    dev_pair_failures = (int*) (dev_buf + offset);
     offset += size_result;
     dev_no_change = (int*) (dev_buf + offset);
     offset += size_no_change;
@@ -184,6 +215,7 @@ struct GpuResources {
     cudaStreamDestroy(stream);
     cudaFreeHost(puz_pinned_buffer);
     cudaFreeHost(results_pinned_buffer);
+    cudaFreeHost(pair_failures_pinned_buffer);
     cudaFree(dev_buf);
 
     enhanced_Hcheck_cuda_error("Freeing resources");

@@ -1571,6 +1571,10 @@ tuple<double, double> PiecesFitTester::getFit(const Puz& p) {
 // ======================================================================
 
 tuple<double, double> TDMSizeFitTester::getFit(const Puz& p) {
+  return getFitWithPairFailures(p, -1);
+}
+
+tuple<double, double> TDMSizeFitTester::getFitWithPairFailures(const Puz& p, int pair_failures) {
   bool shortcut = true;
 
   double s = p.getHeight();  // double b/c overflow of large values.
@@ -1582,7 +1586,7 @@ tuple<double, double> TDMSizeFitTester::getFit(const Puz& p) {
   }
 
   // Parameters for process.
-  unsigned int max_fail = 4;
+  constexpr int max_fail = TDM_PAIR_FAILURE_LIMIT;
   // Fitness just from # of off diagonal edges.
   unsigned int diag = 0;
   unsigned int near_diag = 1;
@@ -1639,7 +1643,11 @@ tuple<double, double> TDMSizeFitTester::getFit(const Puz& p) {
   // of rows to reduce the instance size.
   // XXX - Could be do USP pieces here?
   int fail = 0;
-  if (!shortcut || fit == fit_max) {
+  if (shortcut && fit != fit_max) {
+    fail = max_fail;
+  } else if (pair_failures >= 0) {
+    fail = std::min(pair_failures, max_fail);
+  } else {
     for (int r1 = 0; r1 < s - 1 && fail < max_fail; r1++) {
       for (int r2 = r1 + 1; r2 < s && fail < max_fail; r2++) {
         // Could do in time dependent of k using the already
@@ -1650,8 +1658,6 @@ tuple<double, double> TDMSizeFitTester::getFit(const Puz& p) {
           fail++;
       }
     }
-  } else {
-    fail = max_fail;
   }
   fit += (max_fail - fail) * remaining_max_fit;
   fit_max += max_fail * remaining_max_fit;

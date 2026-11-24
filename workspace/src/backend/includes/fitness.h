@@ -50,6 +50,9 @@ class FitTester {
   // Warning: Naive implementation that doesn't account for internals
   // of DistPuzzle.
   virtual tuple<double, double> getFit(const Puz& p) = 0;
+  virtual tuple<double, double> getFitWithPairFailures(const Puz& p, int) {
+    return getFit(p);
+  }
   virtual string getName() {
     return "yo im wrong";
   };
@@ -328,6 +331,7 @@ class TDMSizeFitTester : public FitTester {
       : mode(mode), strong(strong), require_special(require_special){};
 
   tuple<double, double> getFit(const Puz& p);
+  tuple<double, double> getFitWithPairFailures(const Puz& p, int pair_failures) override;
 
   string getName() {
     return "TDM Size Fit Tester";

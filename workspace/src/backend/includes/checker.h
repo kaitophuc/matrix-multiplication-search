@@ -25,6 +25,7 @@
 
 typedef enum check_val { NO_CHECK = 0, YES_CHECK, MAYBE_CHECK } check_t;
 typedef enum { CHECK_FULL = 0, CHECK_OBVIOUS, CHECK_LOCAL } check_mode_t;
+inline constexpr int TDM_PAIR_FAILURE_LIMIT = 4;
 
 #include <stdio.h>
 #include <stdlib.h>

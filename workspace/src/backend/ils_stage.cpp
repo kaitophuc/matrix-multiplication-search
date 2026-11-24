@@ -7,9 +7,11 @@
 #include <strings.h>
 #include <omp.h>
 #include <queue>
+#include <deque>
 #include <memory>
 #include <assert.h>
 #include <stdexcept>
+#include <sstream>
 #include <thread>
 #include <atomic>
 #include <utility>
@@ -115,17 +117,6 @@ bool ILSStage::is_active(int r, const vector<int>& idxs) {
   return false;
 }
 
-void ILSStage::update_queue(BPMFQ* q, BPPQ** lists, unsigned int q_level, stats_t& stats) {
-  size_t size = 0;
-  for (int i = 0; i < Q_PRIORS; i++) {
-    size += lists[i]->size();
-  }
-
-  size_t enqueued = q->mass_enqueue(lists, q_level);
-  stats.dropped += size - enqueued;
-  stats.evals += size;
-}
-
 unsigned int ILSStage::crop_prior(int q_prior) {
   if (q_prior < 0)
     return 0;
@@ -135,9 +126,9 @@ unsigned int ILSStage::crop_prior(int q_prior) {
 }
 
 bool ILSStage::add_to_frontier(const Puz& p, FitTester* ft, double gap, BPPQ** new_frontiers,
-                               unsigned int q_prior, int type) {
+                               unsigned int q_prior, int type, int pair_failures) {
   double curr_fit, max_fit;
-  tie(curr_fit, max_fit) = ft->getFit(p);
+  tie(curr_fit, max_fit) = ft->getFitWithPairFailures(p, pair_failures);
   // Time consuming
 
   if (curr_fit - max_fit < gap) {
@@ -157,145 +148,62 @@ bool ILSStage::add_to_frontier(const Puz& p, FitTester* ft, double gap, BPPQ** n
   return (prev != NULL && curr_fit == max_fit);
 }
 
-void ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, check_mode_t mode, bool strong,
-                                   FitTester* ft, BPPQ** new_frontiers, int q_prior, double gap,
-                                   int num, elt_type type) {
-  if (num <= 0 || puzzles.empty())
-    return;
+bool ILSStage::expand_frontier_GPU(vector<Puz>& puzzles, FitTester* ft, BPPQ** new_frontiers,
+                                   int q_prior, double gap, elt_type type) {
+  if (puzzles.empty())
+    return false;
 
-  if (gpuTaskSlots.empty()) {
-    throw std::runtime_error("GPU task slots are not initialized.");
-  }
-
-  int worker_id = omp_in_parallel() ? omp_get_thread_num() : 0;
-  int slots_per_worker = std::max(2, gpuSlotsPerWorker);
-  int first_slot_id = slots_per_worker * worker_id;
-  int last_slot_id = first_slot_id + slots_per_worker;
-  if (last_slot_id > (int) gpuTaskSlots.size()) {
+  const int worker_id = omp_in_parallel() ? omp_get_thread_num() : 0;
+  const int slots_per_worker = std::max(2, gpuSlotsPerWorker);
+  const int first_slot_id = slots_per_worker * worker_id;
+  if (first_slot_id + slots_per_worker > (int) gpuTaskSlots.size())
     throw std::runtime_error("OpenMP worker does not have GPU task slots.");
-  }
-  int outstanding = 0;
+
+  std::deque<GpuTask*> outstanding;
+  const bool stop_if_stage_solved = type == ALL || type == REPL_ROW;
   bool stop_processing = false;
 
-  auto process_done_slot = [&](GpuTask& slot) {
-    if (slot.getState() != GpuTaskState::Done) {
-      return false;
-    }
-
+  // In each neighborhood, admit candidates in the original generation order.
+  // A later slot can finish first, but only the first successful candidate stops the expansion.
+  auto drain_next = [&] {
+    GpuTask& slot = *outstanding.front();
+    slot.waitForState(GpuTaskState::Done);
     if (!stop_processing) {
       slot.copyResultsToPuzzles();
-      for (int puz = 0; puz < slot.batch_size; puz++) {
-        if (add_to_frontier(slot.puzzles[puz], ft, slot.gap, new_frontiers, slot.q_prior,
-                            slot.frontier_type)) {
-          stop_processing = true;
-          break;
-        }
-        if (prev != nullptr && numResult() != 0) {
+      for (int i = 0; i < slot.batch_size; ++i) {
+        if (add_to_frontier(slot.puzzles[i], ft, slot.gap, new_frontiers, slot.q_prior,
+                            slot.frontier_type, slot.pairFailures(i)) ||
+            (stop_if_stage_solved && prev != nullptr && numResult() != 0)) {
           stop_processing = true;
           break;
         }
       }
     }
-
     slot.markEmpty();
-    outstanding--;
-    return true;
+    outstanding.pop_front();
   };
 
-  auto process_done_slots = [&](int max_slots) {
-    bool progressed = false;
-    int processed = 0;
-    for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
-      if (max_slots > 0 && processed >= max_slots) {
-        break;
-      }
-      bool slot_progressed = process_done_slot(*gpuTaskSlots[slot_id]);
-      if (slot_progressed) {
-        processed++;
-      }
-      progressed = slot_progressed || progressed;
-    }
-    return progressed;
-  };
-
-  auto process_any_done_slot = [&]() {
-    return process_done_slots(0);
-  };
-
-  auto process_some_done_slots = [&]() {
-    int max_slots = gpu_done_drain_limit();
-    if (max_slots == 0) {
-      return false;
-    }
-    return process_done_slots(max_slots);
-  };
-
-  auto wait_for_slot_progress = [&]() {
-    for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
-      GpuTask& slot = *gpuTaskSlots[slot_id];
-      GpuTaskState state = slot.getState();
-      if (state == GpuTaskState::Ready || state == GpuTaskState::Processing) {
-        std::unique_lock<std::mutex> lock(slot.m);
-        slot.cv.wait_for(lock, std::chrono::milliseconds(1), [&] {
-          GpuTaskState current = slot.getState();
-          return current == GpuTaskState::Done || current == GpuTaskState::Empty;
-        });
-        return;
-      }
-    }
-    std::this_thread::yield();
-  };
-
-  auto acquire_slot = [&]() -> GpuTask* {
-    while (true) {
-      process_some_done_slots();
-      if (stop_processing) {
-        return nullptr;
-      }
-
-      for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
-        GpuTask& slot = *gpuTaskSlots[slot_id];
-        if (slot.tryBeginFilling(worker_id, s, k, q_prior, gap, (int) type)) {
-          return &slot;
-        }
-      }
-
-      bool drained_slot = false;
-      for (int slot_id = first_slot_id; slot_id < last_slot_id; ++slot_id) {
-        GpuTask& slot = *gpuTaskSlots[slot_id];
-        if (slot.getState() == GpuTaskState::Done) {
-          process_done_slot(slot);
-          drained_slot = true;
-          break;
-        }
-      }
-      if (drained_slot) {
-        continue;
-      }
-
-      wait_for_slot_progress();
-    }
-  };
-
-  for (size_t next = 0; next < puzzles.size() && !stop_processing;) {
-    GpuTask* slot = acquire_slot();
-    if (slot == nullptr) {
+  int next_slot = 0;
+  for (size_t offset = 0; offset < puzzles.size() && !stop_processing;) {
+    if ((int) outstanding.size() == slots_per_worker)
+      drain_next();
+    if (stop_processing)
       break;
-    }
-    size_t batch = std::min((size_t) TRIALS, puzzles.size() - next);
-    for (size_t i = 0; i < batch; i++) {
-      slot->appendPuzzle(std::move(puzzles[next + i]));
-    }
-    submitGpuTask(*slot);
-    outstanding++;
-    next += batch;
-  }
 
-  while (outstanding > 0) {
-    if (!process_any_done_slot()) {
-      wait_for_slot_progress();
-    }
+    GpuTask& slot = *gpuTaskSlots[first_slot_id + next_slot];
+    if (!slot.tryBeginFilling(worker_id, s, k, q_prior, gap, (int) type))
+      throw std::logic_error("GPU neighborhood slot is still in use.");
+    const size_t count = std::min((size_t) TRIALS, puzzles.size() - offset);
+    for (size_t i = 0; i < count; ++i)
+      slot.appendPuzzle(std::move(puzzles[offset + i]));
+    submitGpuTask(slot);
+    outstanding.push_back(&slot);
+    offset += count;
+    next_slot = (next_slot + 1) % slots_per_worker;
   }
+  while (!outstanding.empty())
+    drain_next();
+  return stop_processing;
 }
 
 void ILSStage::expand_frontier_GPU_row_replacements(const Puz& base, int row_to_replace,
@@ -331,7 +239,7 @@ void ILSStage::expand_frontier_GPU_row_replacements(const Puz& base, int row_to_
       slot.copyResultsToPuzzles();
       for (int puz = 0; puz < slot.batch_size; puz++) {
         if (add_to_frontier(slot.puzzles[puz], ft, slot.gap, new_frontiers, slot.q_prior,
-                            slot.frontier_type)) {
+                            slot.frontier_type, slot.pairFailures(puz))) {
           stop_processing = true;
           break;
         }
@@ -474,8 +382,7 @@ void ILSStage::expand_frontier(Puz& p, check_mode_t mode, bool strong, FitTester
     } else {
       vector<Puz> simplify_needed;
       append_row_replacements(simplify_needed, p, s - 1, k);
-      expand_frontier_GPU(simplify_needed, mode, strong, ft, new_frontiers, q_prior,
-                          gap, simplify_needed.size(), ALL);
+      expand_frontier_GPU(simplify_needed, ft, new_frontiers, q_prior, gap, ALL);
     }
 
     // Break early if already have a result and are current.
@@ -503,8 +410,7 @@ void ILSStage::expand_frontier(Puz& p, check_mode_t mode, bool strong, FitTester
         } else {
           vector<Puz> simplify_needed;
           append_row_replacements(simplify_needed, p, r, k);
-          expand_frontier_GPU(simplify_needed, mode, strong, ft, new_frontiers, q_prior,
-                              gap, simplify_needed.size(), REPL_ROW);
+          expand_frontier_GPU(simplify_needed, ft, new_frontiers, q_prior, gap, REPL_ROW);
         }
 
         // Break early if already have a result and are current.
@@ -513,6 +419,11 @@ void ILSStage::expand_frontier(Puz& p, check_mode_t mode, bool strong, FitTester
         }
       }
     }
+
+    const bool batch_neighbors = mode == CHECK_OBVIOUS && strong && GpuResources::uses_packed_tdm(s, k);
+    vector<Puz> neighbors;
+    if (batch_neighbors)
+      neighbors.reserve(std::max(2 * s * k, 5 * (s + k)));
 
     // Explore Derivatives
     // Loop over rows.
@@ -529,11 +440,20 @@ void ILSStage::expand_frontier(Puz& p, check_mode_t mode, bool strong, FitTester
 
           // Calculate fitness of new puzzle and add to
           // the local search frontier.
-          if (add_to_frontier(p, ft, gap, new_frontiers, q_prior, DERV))
+          if (batch_neighbors) {
+            neighbors.push_back(p);
+          } else if (add_to_frontier(p, ft, gap, new_frontiers, q_prior, DERV)) {
             return;
+          }
         }
         p.set(r, c, curr);
       }
+    }
+
+    if (batch_neighbors) {
+      if (expand_frontier_GPU(neighbors, ft, new_frontiers, q_prior, gap, DERV))
+        return;
+      neighbors.clear();
     }
 
     // Explore permuting element values in row or column.
@@ -553,10 +473,15 @@ void ILSStage::expand_frontier(Puz& p, check_mode_t mode, bool strong, FitTester
         }
         // Calculate fitness of new puzzle and add to
         // the local search frontier.
-        if (add_to_frontier(p_curr, ft, gap, new_frontiers, q_prior, PERM_ELT))
+        if (batch_neighbors) {
+          neighbors.push_back(std::move(p_curr));
+        } else if (add_to_frontier(p_curr, ft, gap, new_frontiers, q_prior, PERM_ELT)) {
           return;
+        }
       }
     }
+    if (batch_neighbors)
+      expand_frontier_GPU(neighbors, ft, new_frontiers, q_prior, gap, PERM_ELT);
   }
 }
 
@@ -591,51 +516,41 @@ unsigned int ILSStage::getHeight() {
 
 // Perform one unit of work on this stage.
 bool ILSStage::doWork(check_mode_t mode, bool strong) {
-  if (stats.mode == ILS_INACTIVE)
-    cerr << "ERROR: STAGE IS INACTIVE" << '\n';
-  ;
-  assert(stats.mode != ILS_INACTIVE);
-  bool working = false;
+  std::unique_ptr<Puz> previous_result;
   Puz p;
   double gap;
   q_elt_t e;
   int q_level;
   int q_prior;
 
-#pragma omp critical(queue)
   {
-    bool success1 = false;
+    std::lock_guard<std::mutex> lock(frontier_mutex);
     if (prev != nullptr &&
         (work_queues->is_empty() || safe_rand() <= PROB_GET_PREV / (PROB_GET_PREV + PROB_CURR))) {
-      Puz* p_ptr = prev->takeResult();
-      if (p_ptr != nullptr) {
-        working = true;
-        success1 = true;
-        p = *p_ptr;
-        p = p.resizePuz(1);
-        delete p_ptr;
-        e.elt_type = INIT;
-        q_level = -1;
-        q_prior = 0;
-        double fit, max_fit;
-        tie(fit, max_fit) = ft->getFit(p);
-        gap = fit - max_fit;
-      }
+      previous_result.reset(prev->takeResult());
     }
-    bool success2 = false;
-    if (!success1 && !work_queues->is_empty()) {
-      working = true;
-#pragma omp critical(stats)
-      stats.working++;
-      work_queues->dequeue(e, q_level, q_prior);
-      gap = e.gap;
-      p = e.p;
-      success2 = true;
+    if (!previous_result && !work_queues->dequeue(e, q_level, q_prior)) {
+      return false;
     }
   }
 
-  if (!working)
-    return false;
+  if (previous_result) {
+    p = previous_result->resizePuz(1);
+    e.elt_type = INIT;
+    q_level = -1;
+    q_prior = 0;
+    auto [fit, max_fit] = ft->getFit(p);
+    gap = fit - max_fit;
+  } else {
+    gap = e.gap;
+    p = std::move(e.p);
+  }
+
+#pragma omp critical(stats)
+  {
+    assert(stats.mode != ILS_INACTIVE);
+    stats.working++;
+  }
 
   bool seen = false;
 #pragma omp critical(isomorph)
@@ -665,7 +580,10 @@ bool ILSStage::doWork(check_mode_t mode, bool strong) {
       stats.mode = ILS_FEED;
     }
 #pragma omp critical(results)
-    results.push_back(p);
+    {
+      results.push_back(p);
+      result_count.store(results.size(), std::memory_order_release);
+    }
   }
 
   BPPQ* local_qs[Q_PRIORS];
@@ -682,11 +600,19 @@ bool ILSStage::doWork(check_mode_t mode, bool strong) {
   // Expand the frontier to generate new puzzles.
   expand_frontier(p, mode, strong, ft, local_qs, q_prior, gap, e.elt_type == INIT);
 
-#pragma omp critical(queue)
+  size_t candidates = 0;
+  for (const auto* local_queue : local_qs) {
+    candidates += local_queue->size();
+  }
+  size_t enqueued;
+  {
+    std::lock_guard<std::mutex> lock(frontier_mutex);
+    enqueued = work_queues->merge_from(local_qs, std::min(q_level + 1, Q_LEVELS - 1));
+  }
 #pragma omp critical(stats)
   {
-    update_queue(work_queues, local_qs, (q_level < Q_LEVELS - 1 ? q_level + 1 : Q_LEVELS - 1),
-                 stats);
+    stats.dropped += candidates - enqueued;
+    stats.evals += candidates;
     stats.working--;
   }
 
@@ -703,24 +629,23 @@ Puz* ILSStage::takeResult(bool pop) {
   {
     if (!results.empty()) {
       res = new Puz(results.back());
-      if (pop)
+      if (pop) {
         results.pop_back();
+        result_count.store(results.size(), std::memory_order_release);
+      }
     }
   }
   return res;
 }
 
 unsigned int ILSStage::numResult() {
-  unsigned int res = 0;
-#pragma omp critical(results)
-  res = results.size();
-  return res;
+  return result_count.load(std::memory_order_acquire);
 }
 
 // Safely deactivates the previous stage.
 void ILSStage::deactivatePrev() {
-#pragma omp critical(queue)
-  { prev.reset(); }
+  std::lock_guard<std::mutex> lock(frontier_mutex);
+  prev.reset();
 }
 
 void ILSStage::try_restart() {
@@ -733,61 +658,77 @@ void ILSStage::try_restart() {
 
 void ILSStage::display_stats(string counts_str) {
   usleep(200000);
+  stats_t snapshot;
 #pragma omp critical(stats)
-  {
-    if (stats.proc != 0) {
-      auto stop = chrono::high_resolution_clock::now();
-      auto duration = chrono::duration<double>(stop - stats.start + stats.total_time);
-      double time_secs = duration.count();
-      cout << "\033[150A\r\033[J";
-      work_queues->display();
-      double eval_rate = stats.evals / time_secs;
-      cout << "\n s: " << setw(3) << s << ", #: " << setw(6) << stats.proc << " (" << setw(6)
-           << stats.since_progress << ", r: " << setw(3) << stats.restarts
-           << "), Gap: " << scientific << setprecision(4) << stats.best_gap;
-      cout << "\n Q: " << setw(7) << work_queues->size() << " [" << setprecision(4)
-           << work_queues->best() << " .. " << setprecision(4) << work_queues->worst() << "]";
-      cout << " (Prev Stages: " << counts_str << "), ";
-      cout << "\n Distinct: " << setw(6) << get_num_isomorphs() << ", Repeated: " << setw(6)
-           << stats.repeated;
-      cout << "\n Eval: " << setprecision(4) << (double) (stats.evals) << " (per sec: " << fixed
-           << setprecision(0) << eval_rate << "), ";
-      auto num_gpu = TDM::getNumGPUSimplify();
-      auto num_cpu = TDM::getNumSimplify();
-      auto tot_simplify = num_gpu + num_cpu;
-      static const auto live_start = chrono::high_resolution_clock::now();
-      static const unsigned long long live_start_gpu = num_gpu;
-      static const unsigned long long live_start_cpu = num_cpu;
-      double live_time_secs = chrono::duration<double>(stop - live_start).count();
-      unsigned long long live_gpu = (num_gpu >= live_start_gpu ? num_gpu - live_start_gpu : num_gpu);
-      unsigned long long live_cpu = (num_cpu >= live_start_cpu ? num_cpu - live_start_cpu : num_cpu);
-      unsigned long long live_tot_simplify = live_gpu + live_cpu;
-      cout << "\n GPU Simplify: " << setw(8) << num_gpu << " (" << setw(3) << fixed
-           << setprecision(0) << (tot_simplify ? 100.0 * num_gpu / tot_simplify : 0) << "%) (per sec: "
-           << setw(8) << fixed << setprecision(2) << (time_secs ? num_gpu / time_secs : 0) << ")";
-      cout << "\n CPU Simplify: " << setw(8) << num_cpu << " (" << setw(3) << fixed
-           << setprecision(0) << (tot_simplify ? 100.0 * num_cpu / tot_simplify : 0) << "%) (per sec: "
-           << setw(8) << fixed << setprecision(2) << (time_secs ? num_cpu / time_secs : 0) << ")";
-      cout << "\n Tot Simplify: " << setw(8) << tot_simplify
-           << " (100%) (per sec: " << setw(8) << fixed << setprecision(2)
-           << (time_secs ? tot_simplify / time_secs : 0) << ")";
-      cout << "\n Live Simplify: " << setw(8) << live_tot_simplify
-           << " (GPU " << live_gpu << ", CPU " << live_cpu << ") (per sec: "
-           << setw(8) << fixed << setprecision(2)
-           << (live_time_secs ? live_tot_simplify / live_time_secs : 0) << ")";
-      cout << "\n Total Time: " << fixed << setprecision(2) << time_secs << " secs";
-      if (stats.searched_types[0] != 0)
-        cerr << "ERROR: searched_types[0] != 0\n";
-      assert(stats.searched_types[0] == 0);
-      cout << "\n ST: [INIT:" << setw(4) << stats.searched_types[1] << ", DERV:" << setw(4)
-           << stats.searched_types[2] << ", RAND:" << setw(4) << stats.searched_types[3]
-           << ", PERM_ELT:" << setw(4) << stats.searched_types[4] << ", PERM_ROW:" << setw(4)
-           << stats.searched_types[5] << ", ALL:" << setw(4) << stats.searched_types[6]
-           << ", COL_SWAP:" << setw(4) << stats.searched_types[7] << ", REPL_ROW:" << setw(4)
-           << stats.searched_types[8] << "]" << '\n';
-      fflush(stdout);
-    }
+  { snapshot = stats; }
+  if (snapshot.proc == 0) {
+    return;
   }
+  std::ostringstream queue_details;
+  size_t queue_size;
+  double queue_best;
+  double queue_worst;
+  {
+    std::lock_guard<std::mutex> lock(frontier_mutex);
+    work_queues->display(queue_details);
+    queue_size = work_queues->size();
+    queue_best = work_queues->best();
+    queue_worst = work_queues->worst();
+  }
+  size_t distinct;
+#pragma omp critical(isomorph)
+  { distinct = get_num_isomorphs(); }
+  const auto& stats = snapshot;
+  auto stop = chrono::high_resolution_clock::now();
+  auto duration = chrono::duration<double>(stop - stats.start + stats.total_time);
+  double time_secs = duration.count();
+  cout << "\033[150A\r\033[J";
+  cout << queue_details.str();
+  double eval_rate = stats.evals / time_secs;
+  cout << "\n s: " << setw(3) << s << ", #: " << setw(6) << stats.proc << " (" << setw(6)
+       << stats.since_progress << ", r: " << setw(3) << stats.restarts
+       << "), Gap: " << scientific << setprecision(4) << stats.best_gap;
+  cout << "\n Q: " << setw(7) << queue_size << " [" << setprecision(4)
+       << queue_best << " .. " << setprecision(4) << queue_worst << "]";
+  cout << " (Prev Stages: " << counts_str << "), ";
+  cout << "\n Distinct: " << setw(6) << distinct << ", Repeated: " << setw(6)
+       << stats.repeated;
+  cout << "\n Eval: " << setprecision(4) << (double) (stats.evals) << " (per sec: " << fixed
+       << setprecision(0) << eval_rate << "), ";
+  auto num_gpu = TDM::getNumGPUSimplify();
+  auto num_cpu = TDM::getNumSimplify();
+  auto tot_simplify = num_gpu + num_cpu;
+  static const auto live_start = chrono::high_resolution_clock::now();
+  static const unsigned long long live_start_gpu = num_gpu;
+  static const unsigned long long live_start_cpu = num_cpu;
+  double live_time_secs = chrono::duration<double>(stop - live_start).count();
+  unsigned long long live_gpu = (num_gpu >= live_start_gpu ? num_gpu - live_start_gpu : num_gpu);
+  unsigned long long live_cpu = (num_cpu >= live_start_cpu ? num_cpu - live_start_cpu : num_cpu);
+  unsigned long long live_tot_simplify = live_gpu + live_cpu;
+  cout << "\n GPU Simplify: " << setw(8) << num_gpu << " (" << setw(3) << fixed
+       << setprecision(0) << (tot_simplify ? 100.0 * num_gpu / tot_simplify : 0) << "%) (per sec: "
+       << setw(8) << fixed << setprecision(2) << (time_secs ? num_gpu / time_secs : 0) << ")";
+  cout << "\n CPU Simplify: " << setw(8) << num_cpu << " (" << setw(3) << fixed
+       << setprecision(0) << (tot_simplify ? 100.0 * num_cpu / tot_simplify : 0) << "%) (per sec: "
+       << setw(8) << fixed << setprecision(2) << (time_secs ? num_cpu / time_secs : 0) << ")";
+  cout << "\n Tot Simplify: " << setw(8) << tot_simplify
+       << " (100%) (per sec: " << setw(8) << fixed << setprecision(2)
+       << (time_secs ? tot_simplify / time_secs : 0) << ")";
+  cout << "\n Live Simplify: " << setw(8) << live_tot_simplify
+       << " (GPU " << live_gpu << ", CPU " << live_cpu << ") (per sec: "
+       << setw(8) << fixed << setprecision(2)
+       << (live_time_secs ? live_tot_simplify / live_time_secs : 0) << ")";
+  cout << "\n Total Time: " << fixed << setprecision(2) << time_secs << " secs";
+  if (stats.searched_types[0] != 0)
+    cerr << "ERROR: searched_types[0] != 0\n";
+  assert(stats.searched_types[0] == 0);
+  cout << "\n ST: [INIT:" << setw(4) << stats.searched_types[1] << ", DERV:" << setw(4)
+       << stats.searched_types[2] << ", RAND:" << setw(4) << stats.searched_types[3]
+       << ", PERM_ELT:" << setw(4) << stats.searched_types[4] << ", PERM_ROW:" << setw(4)
+       << stats.searched_types[5] << ", ALL:" << setw(4) << stats.searched_types[6]
+       << ", COL_SWAP:" << setw(4) << stats.searched_types[7] << ", REPL_ROW:" << setw(4)
+       << stats.searched_types[8] << "]" << '\n';
+  fflush(stdout);
 }
 
 void ILSStage::serialize(std::ostream& os) const {
@@ -819,6 +760,7 @@ void ILSStage::deserialize(std::istream& is) {
     p.deserialize(is);
     results.push_back(p);
   }
+  result_count.store(results.size(), std::memory_order_release);
   // Deserialize additional data
   bool has_prev;
   is.read(reinterpret_cast<char*>(&has_prev), sizeof(has_prev));

@@ -1,14 +1,15 @@
 #pragma once
 
-#include <set>
 #include "Puz.h"
-// Missing these includes at the top:
 #include <iostream>
 #include <iomanip>
 #include <fstream>
 #include <set>
 #include <cassert>
 #include <cstdio>
+#include <iterator>
+#include <limits>
+#include <utility>
 
 #define QUEUE_LIMIT 100000
 #define QUEUE_LEVELS 3
@@ -34,7 +35,7 @@ typedef struct _q_elt_t {
 } q_elt_t;
 
 struct cmp {
-  bool operator()(q_elt_t left, q_elt_t right) const {
+  bool operator()(const q_elt_t& left, const q_elt_t& right) const {
     return left.gap > right.gap;
   };
 };
@@ -44,10 +45,11 @@ typedef std::multiset<q_elt_t, cmp> set_t;
 class BoundedPuzPriorityQueue {
  private:
   set_t q;
-  double best_prior;  // Bounds may not be valid if empty.
-  double worst_prior;
   size_t limit;
-  Puz dummy_p;
+
+  bool accepts(double gap) const {
+    return size() < limit || gap > worst();
+  }
 
  public:
   void serialize(ostream& os) const {
@@ -56,6 +58,8 @@ class BoundedPuzPriorityQueue {
     for (const auto& elt : q) {
       elt.serialize(os);
     }
+    double best_prior = best();
+    double worst_prior = worst();
     os.write(reinterpret_cast<const char*>(&best_prior), sizeof(best_prior));
     os.write(reinterpret_cast<const char*>(&worst_prior), sizeof(worst_prior));
     os.write(reinterpret_cast<const char*>(&limit), sizeof(limit));
@@ -68,59 +72,47 @@ class BoundedPuzPriorityQueue {
     for (int i = 0; i < size; i++) {
       q_elt_t elt;
       elt.deserialize(is);
-      q.insert(elt);
+      q.insert(q.end(), std::move(elt));
     }
-    is.read(reinterpret_cast<char*>(&best_prior), sizeof(best_prior));
-    is.read(reinterpret_cast<char*>(&worst_prior), sizeof(worst_prior));
+    // Older checkpoints store cached bounds, which can be stale after a dequeue.
+    double saved_bound;
+    is.read(reinterpret_cast<char*>(&saved_bound), sizeof(saved_bound));
+    is.read(reinterpret_cast<char*>(&saved_bound), sizeof(saved_bound));
     is.read(reinterpret_cast<char*>(&limit), sizeof(limit));
   }
 
   BoundedPuzPriorityQueue(size_t limit = QUEUE_LIMIT) : limit(limit) {
     assert(limit > 0);
-    dummy_p = Puz(1, 1);
   }
 
-  bool enqueue(const q_elt_t& t) {
-    double prior = t.gap;
-
-    // At limit and no better than worst, reject.
-    if (size() == limit && prior <= worst_prior) {
+  bool enqueue(q_elt_t t) {
+    if (!accepts(t.gap)) {
       return false;
     }
-
-    //  At limit, remove worst first.
     if (size() == limit) {
-      // auto worst = q.lower_bound(tuple<double, Puz>{
-      //	  max_prior, dummy_p});
-      q_elt_t elt = *(q.rbegin());
-      q.erase(elt);
-      worst_prior = (*q.rbegin()).gap;
+      q.erase(std::prev(q.end()));
     }
-
-    // Insert new element.
-    q.insert(t);
-
-    if (size() == 1) {
-      best_prior = prior;
-      worst_prior = prior;
-    } else {
-      best_prior = (prior > best_prior ? prior : best_prior);
-      worst_prior = (prior < worst_prior ? prior : worst_prior);
-    }
-
+    q.insert(std::move(t));
     return true;
   }
 
-  size_t mass_enqueue(BoundedPuzPriorityQueue* list) {
+  // Transfer accepted nodes in priority order. The caller can release the
+  // rejected suffix of the source after dropping the frontier mutex.
+  size_t merge_from(BoundedPuzPriorityQueue& source) {
     size_t enqueued = 0;
-    size_t l_size = list->size();
-    for (int i = 0; i < l_size; i++) {
-      q_elt_t e;
-      list->dequeue(e);
-      assert(e.p.getHeight() > 0);
-      enqueued += (enqueue(e) ? 1 : 0);
+    while (!source.is_empty() && accepts(source.best())) {
+      if (size() == limit) {
+        q.erase(std::prev(q.end()));
+      }
+      q.insert(source.q.extract(source.q.begin()));
+      ++enqueued;
     }
+    return enqueued;
+  }
 
+  size_t mass_enqueue(BoundedPuzPriorityQueue* list) {
+    size_t enqueued = merge_from(*list);
+    list->clear();
     return enqueued;
   }
 
@@ -128,14 +120,8 @@ class BoundedPuzPriorityQueue {
     if (is_empty())
       return false;
 
-    auto best = *(q.begin());
-
-    elt = best;
-    q.erase(best);
-
-    if (size() > 1)
-      best_prior = q.begin()->gap;
-
+    auto node = q.extract(q.begin());
+    elt = std::move(node.value());
     return true;
   }
 
@@ -143,16 +129,16 @@ class BoundedPuzPriorityQueue {
     return q.size();
   }
 
-  double best() {
-    return best_prior;
+  double best() const {
+    return is_empty() ? 0.0 : q.begin()->gap;
   }
 
-  double worst() {
-    return worst_prior;
+  double worst() const {
+    return is_empty() ? 0.0 : q.rbegin()->gap;
   }
 
-  bool is_empty() {
-    return size() == 0;
+  bool is_empty() const {
+    return q.empty();
   }
 
   void clear() {
@@ -160,13 +146,13 @@ class BoundedPuzPriorityQueue {
   }
 
   void display() {
-    printf("%6ld, [%6.4e..%6.4e]\n", size(), best_prior, worst_prior);
+    printf("%6ld, [%6.4e..%6.4e]\n", size(), best(), worst());
     // printf("q.size(): %6ld\n", q.size());
   }
 
   void display(std::ostream& os) const {
-    os << std::setw(6) << size() << ", [" << std::setprecision(4) << std::scientific << best_prior
-       << ".." << std::setprecision(4) << std::scientific << worst_prior << "]\n";
+    os << std::setw(6) << size() << ", [" << std::setprecision(4) << std::scientific << best()
+       << ".." << std::setprecision(4) << std::scientific << worst() << "]\n";
   }
 };
 
@@ -232,6 +218,15 @@ class BoundedPuzMultilevelFeedbackQueue {
       ret += queues[q_level * priors + i]->mass_enqueue(lists[i]);
     }
     return ret;
+  }
+
+  size_t merge_from(BPPQ** lists, int q_level) {
+    assert(q_level >= 0 && q_level < levels);
+    size_t enqueued = 0;
+    for (unsigned int i = 0; i < priors; ++i) {
+      enqueued += queues[q_level * priors + i]->merge_from(*lists[i]);
+    }
+    return enqueued;
   }
 
   bool enqueue(const q_elt_t& t, int q_level, int q_prior) {
@@ -311,19 +306,19 @@ class BoundedPuzMultilevelFeedbackQueue {
   }
 
   double best() {
-    double ret = queues[0]->best();
+    double ret = -std::numeric_limits<double>::infinity();
     for (int i = 0; i < levels * priors; i++)
       if (!queues[i]->is_empty())
         ret = (queues[i]->best() > ret ? queues[i]->best() : ret);
-    return ret;
+    return ret == -std::numeric_limits<double>::infinity() ? 0.0 : ret;
   }
 
   double worst() {
-    double ret = queues[0]->worst();
+    double ret = std::numeric_limits<double>::infinity();
     for (int i = 0; i < levels * priors; i++)
       if (!queues[i]->is_empty())
         ret = (queues[i]->worst() < ret ? queues[i]->worst() : ret);
-    return ret;
+    return ret == std::numeric_limits<double>::infinity() ? 0.0 : ret;
   }
 
   bool is_empty() {

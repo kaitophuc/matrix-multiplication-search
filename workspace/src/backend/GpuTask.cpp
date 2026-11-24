@@ -41,6 +41,7 @@ void GpuTask::allocatePinned(int max_s, int max_k, int max_batch, int slot_id,
 
   cudaMallocHost(&puz_pinned_buffer, pinned_puz_entries * sizeof(e_type));
   cudaMallocHost(&results_pinned_buffer, (size_t) max_batch * sizeof(int));
+  cudaMallocHost(&pair_failures_pinned_buffer, (size_t) max_batch * sizeof(int));
   enhanced_Hcheck_cuda_error("Allocating pinned GpuTask slot memory");
   owns_pinned_buffers = true;
 
@@ -55,8 +56,13 @@ void GpuTask::releasePinned() {
   if (owns_pinned_buffers && results_pinned_buffer != nullptr) {
     cudaFreeHost(results_pinned_buffer);
   }
+  if (owns_pinned_buffers && pair_failures_pinned_buffer != nullptr) {
+    cudaFreeHost(pair_failures_pinned_buffer);
+  }
   puz_pinned_buffer = nullptr;
   results_pinned_buffer = nullptr;
+  pair_failures_pinned_buffer = nullptr;
+  pair_failures_ready = false;
   owns_pinned_buffers = false;
   pinned_puz_entries = 0;
 }
@@ -73,6 +79,7 @@ bool GpuTask::tryBeginFilling(int worker_id, int new_s, int new_k, int new_q_pri
   s = new_s;
   k = new_k;
   batch_size = 0;
+  pair_failures_ready = false;
   origin_worker_id = worker_id;
   q_prior = new_q_prior;
   gap = new_gap;

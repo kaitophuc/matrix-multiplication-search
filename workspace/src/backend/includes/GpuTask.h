@@ -45,6 +45,8 @@ class GpuTask {
 
   e_type* puz_pinned_buffer = nullptr;
   int* results_pinned_buffer = nullptr;
+  int* pair_failures_pinned_buffer = nullptr;
+  bool pair_failures_ready = false;
   bool owns_pinned_buffers = false;
   int max_s = 0;
   int max_k = 0;
@@ -93,6 +95,7 @@ class GpuTask {
       q_prior = other.q_prior;
       gap = other.gap;
       frontier_type = other.frontier_type;
+      pair_failures_ready = false;
       state.store(other.state.load(std::memory_order_acquire), std::memory_order_release);
       result.results.clear();
       puzzles.clear();
@@ -126,6 +129,9 @@ class GpuTask {
   GpuTaskState getState() const;
   void waitForState(GpuTaskState desired);
   void copyResultsToPuzzles();
+  int pairFailures(int candidate) const {
+    return pair_failures_ready ? pair_failures_pinned_buffer[candidate] : -1;
+  }
 
   void solve(GpuResources& gpu_resources);
   void solveFromPinnedBuffers(GpuResources& gpu_resources);

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <vector>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include "Puz.h"
 #include "BoundedPuzPriorityQueue.h"
@@ -52,24 +54,24 @@ class ILSStage {
   void setPrev(std::shared_ptr<ILSStage> p);
 
  private:
+  std::mutex frontier_mutex;
   unsigned int s;
   unsigned int k;
 
   std::vector<Puz> results;
+  std::atomic<unsigned int> result_count{0};
 
   void init_stats();
 
   bool is_active(int r, const std::vector<int>& idxs);
 
-  void update_queue(BPMFQ* q, BPPQ** lists, unsigned int q_level, stats_t& stats);
-
   unsigned int crop_prior(int q_prior);
 
   bool add_to_frontier(const Puz& p, FitTester* ft, double gap, BPPQ** new_frontiers,
-                       unsigned int q_prior, int type);
+                       unsigned int q_prior, int type, int pair_failures = -1);
 
-  void expand_frontier_GPU(std::vector<Puz>& puzzles, check_mode_t mode, bool strong, FitTester* ft,
-                           BPPQ** new_frontiers, int q_prior, double gap, int num, elt_type type);
+  bool expand_frontier_GPU(std::vector<Puz>& puzzles, FitTester* ft, BPPQ** new_frontiers,
+                           int q_prior, double gap, elt_type type);
   void expand_frontier_GPU_row_replacements(const Puz& base, int row_to_replace,
                                             check_mode_t mode, bool strong, FitTester* ft,
                                             BPPQ** new_frontiers, int q_prior,

@@ -2,8 +2,8 @@
 
 #include <random>
 
-// Thread-safe random generator in [0,1)
+// Use the process seed once per worker, then generate priority jitter locally.
 inline double safe_rand() {
-  double d = (double) (random() % 1000000) / 1000000.0;
-  return d;
+  static thread_local std::mt19937 generator(static_cast<unsigned int>(random()));
+  return static_cast<double>((generator() >> 1) % 1000000) / 1000000.0;
 }

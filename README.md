@@ -73,7 +73,7 @@ many trials at once through a reusable `GpuResources` object.
 | Host memory | Regular host allocations and per-call setup. | Pinned host buffers via `cudaMallocHost` for faster async transfer. |
 | Device memory | Allocates temporary device memory inside each simplify call. | Allocates one aligned contiguous device buffer per `GpuResources` instance and reuses it. |
 | Stream model | Mostly synchronous single-call flow. | Uses a CUDA stream per GPU worker for async copies, memset, kernels, and result transfer. |
-| TDM storage | `bool` TDM table. | `uint8_t` TDM table, sized for batched trials. |
+| TDM storage | `bool` TDM table. | One 64-bit word per TDM line for 33–64 rows and up to 16 columns. Other sizes use the byte layout. |
 | Small-`k` witness test | Character comparisons across columns. | `isWitness16_Kernel_u32` uses bit masks and packed 2-bit entries for `k <= 16`. |
 | TDM construction | Generic `8 x 8 x 8` thread blocks over row triples. | Small-`k` cached kernel stores packed rows in shared memory; general fallback handles wider puzzles. |
 | Projection | One projection kernel over `x, y, z`. | Face-specific projection kernel over `s * s` cells per trial, skipping completed trials with `no_change`. |
@@ -118,6 +118,8 @@ runtime around it:
 - Supports multiple CUDA devices and multiple coordinator lanes per device.
 - Streams row-replacement candidates directly into GPU slots, avoiding a large
   temporary vector for the `3^k` replacement frontier.
+- Returns the capped row-pair failure count with GPU simplify scores. The packed
+  strong `CHECK_OBVIOUS` path also batches derivatives and symbol permutations.
 - Adds `.dat` checkpoint/resume, auto-start from matching checkpoints in `data/`,
   and SIGINT-triggered checkpoint before exit.
 - Adds optional Bloom filtering for the isomorph cache with serialization.
@@ -215,7 +217,7 @@ The enhanced searcher exposes several environment variables for tuning:
 | `ILS_GPU_DEVICES` | all devices | Number of CUDA devices to use. `ILS_GPU_WORKERS` is accepted as a legacy alias. |
 | `ILS_GPU_LANES_PER_DEVICE` | `2` | GPU coordinator threads per selected CUDA device. |
 | `ILS_GPU_BATCH_SLOTS` | `32` | Requested number of `GpuTask` slots to coalesce per CUDA launch. |
-| `ILS_GPU_MAX_BATCH_MB` | `512` | Memory cap used to choose maximum puzzles per coalesced launch. |
+| `ILS_GPU_MAX_BATCH_MB` | `512` | Per-lane memory cap for a coalesced launch. The capacity accounts for the packed TDM layout and any smaller stages using the byte layout. |
 | `ILS_GPU_SLOTS_PER_WORKER` | `32` | Reusable pinned task slots owned by each OpenMP worker. |
 | `ILS_GPU_COALESCE_US` | `5000` | Age at which a partial size-specific batch becomes eligible for a free coordinator. Set to `0` for immediate eligibility. |
 | `ILS_GPU_MOD_BLOCKS_PER_TRIAL` | size-dependent | Blocks per trial for TDM modification kernels, capped at 16. |

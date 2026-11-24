@@ -561,9 +561,322 @@ __global__ void computeTDM_Kernel(e_type* d_Puz, uint8_t* d_TDM, unsigned int s,
   }
 }
 
+// Each word stores the z edges for one (x, y) line of the TDM.
+using PackedLine = unsigned long long;
+
+template <typename Word>
+struct RowSymbols {
+  Word one;
+  Word two;
+  Word three;
+};
+
+template <typename Word>
+static __device__ __forceinline__ RowSymbols<Word> row_symbols(Word row, Word columns) {
+  const Word two = row ^ columns;
+  const Word three = row ^ (columns << 1);
+  return {~(row | (row >> 1)) & columns,
+          ~(two | (two >> 1)) & columns,
+          ~(three | (three >> 1)) & columns};
+}
+
+template <GpuPairCheck check, typename Word>
+static __device__ __forceinline__ unsigned differing_symbols(RowSymbols<Word> a,
+                                                              RowSymbols<Word> b) {
+  // Two of the three roles use the same row. A witness for the remaining
+  // role exists exactly where that symbol is present only in the other row.
+  if constexpr (check == GpuPairCheck::Local) {
+    return ((a.one & ~b.one) != 0) | (((a.two & ~b.two) != 0) << 1) |
+           (((a.three & ~b.three) != 0) << 2) | (((b.one & ~a.one) != 0) << 3) |
+           (((b.two & ~a.two) != 0) << 4) | (((b.three & ~a.three) != 0) << 5);
+  }
+  return (a.one != b.one) | ((a.two != b.two) << 1) | ((a.three != b.three) << 2);
+}
+
+template <GpuPairCheck check>
+static constexpr unsigned required_differences = check == GpuPairCheck::Local ? 63 : 7;
+
+static __device__ __forceinline__ void store_failed_pairs(int* pair_failures, int local_count) {
+  using Reduction = cub::BlockReduce<int, TDM_THREADS>;
+  __shared__ typename Reduction::TempStorage scratch;
+  int count = Reduction(scratch).Sum(local_count);
+  if (threadIdx.x == 0)
+    pair_failures[blockIdx.x] = count < TDM_PAIR_FAILURE_LIMIT ? count : TDM_PAIR_FAILURE_LIMIT;
+}
+
+static __device__ __forceinline__ PackedLine row_mask(int s) {
+  return s == 64 ? ~0ull : (1ull << s) - 1ull;
+}
+
+template <GpuPairCheck check>
+static __global__ void build_packed_tdm(const e_type* input, PackedLine* tdm, int* pair_failures,
+                                       int s, int k, uint32_t allow) {
+  __shared__ RowSymbols<uint32_t> symbols[64];
+  __shared__ PackedLine columns[16];
+
+  const int trial = blockIdx.x;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x / 32;
+  const auto* puz = input + static_cast<size_t>(trial) * s;
+  const uint32_t low_row = puz[lane];
+  const uint32_t high_row = lane + 32 < s ? puz[lane + 32] : 0u;
+
+  if (warp == 0) {
+    symbols[lane] = row_symbols(low_row, allow);
+    if (lane + 32 < s)
+      symbols[lane + 32] = row_symbols(high_row, allow);
+  }
+
+  // Each warp builds a mask of the z rows that match symbol 3 in its column.
+  for (int col = warp; col < k; col += blockDim.x / 32) {
+    const int shift = 2 * col;
+    const uint32_t low = __ballot_sync(0xffffffffu, ((low_row >> shift) & 3u) == 2u);
+    const uint32_t high = __ballot_sync(0xffffffffu, ((high_row >> shift) & 3u) == 2u);
+    if (lane == 0)
+      columns[col] = (static_cast<PackedLine>(high) << 32) | low;
+  }
+  __syncthreads();
+
+  const int cells = s * s;
+  PackedLine* out = tdm + static_cast<size_t>(trial) * cells;
+  int failed_pairs = 0;
+  for (int xy = threadIdx.x; xy < cells; xy += blockDim.x) {
+    const int x = xy / s;
+    const int y = xy % s;
+    if constexpr (check != GpuPairCheck::Disabled) {
+      if (x < y)
+        failed_pairs += differing_symbols<check>(symbols[x], symbols[y]) != required_differences<check>;
+    }
+    const unsigned int a = symbols[x].one;
+    const unsigned int b = symbols[y].two;
+    PackedLine line = row_mask(s);
+    // When x and y both match their symbols, only matching z keeps the edge.
+    // When exactly one matches, a matching z is the witness that removes it.
+    for (unsigned int both = a & b; both; both &= both - 1)
+      line &= columns[(__ffs(both) - 1) / 2];
+    for (unsigned int only_one = a ^ b; only_one; only_one &= only_one - 1)
+      line &= ~columns[(__ffs(only_one) - 1) / 2];
+    out[xy] = line;
+  }
+  if constexpr (check != GpuPairCheck::Disabled)
+    store_failed_pairs(pair_failures, failed_pairs);
+}
+
+template <GpuPairCheck check>
+static __global__ void count_pair_failures(const e_type* input, int* failures, int s, int k,
+                                           int entries_per_row) {
+  const auto* puz = input + static_cast<size_t>(blockIdx.x) * s * entries_per_row;
+  constexpr e_type all_columns = 0x5555555555555555ull;
+  const int last_columns = k - (entries_per_row - 1) * ELTS_PER_ENTRY;
+  const e_type last_mask = last_columns == ELTS_PER_ENTRY
+                              ? all_columns : all_columns & ((1ull << (2 * last_columns)) - 1);
+  int failed_pairs = 0;
+  for (int xy = threadIdx.x; xy < s * s; xy += blockDim.x) {
+    const int x = xy / s;
+    const int y = xy % s;
+    if (x >= y)
+      continue;
+    unsigned differences = 0;
+    for (int i = 0; i < entries_per_row && differences != required_differences<check>; ++i) {
+      const e_type columns = i + 1 == entries_per_row ? last_mask : all_columns;
+      differences |= differing_symbols<check>(row_symbols(puz[x * entries_per_row + i], columns),
+                                               row_symbols(puz[y * entries_per_row + i], columns));
+    }
+    failed_pairs += differences != required_differences<check>;
+  }
+  store_failed_pairs(failures, failed_pairs);
+}
+
+static __global__ void packed_project_yz(const PackedLine* tdm, PackedLine* projections,
+                                  const int* no_change, int s) {
+  const int trial = blockIdx.x;
+  const int y = threadIdx.x;
+  if (no_change[trial] >= 3 || y >= s)
+    return;
+  const auto* line = tdm + static_cast<size_t>(trial) * s * s + y;
+  PackedLine projection = 0;
+  for (int x = 0; x < s; ++x)
+    projection |= line[x * s];
+  projections[trial * s + y] = projection;
+}
+
+static __global__ void packed_project_x(const PackedLine* tdm, PackedLine* projections,
+                                  const int* no_change, int s, int face) {
+  const int trial = blockIdx.y;
+  const int x = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (x >= s || no_change[trial] >= 3)
+    return;
+  const int lane = threadIdx.x & 31;
+  const auto* line = tdm + (static_cast<size_t>(trial) * s + x) * s;
+  const PackedLine a = lane < s ? line[lane] : 0;
+  const PackedLine b = lane + 32 < s ? line[lane + 32] : 0;
+  unsigned int low, high;
+  if (face == 1) {
+    const PackedLine bits = a | b;
+#if __CUDA_ARCH__ >= 800
+    low = __reduce_or_sync(0xffffffffu, static_cast<unsigned int>(bits));
+    high = __reduce_or_sync(0xffffffffu, static_cast<unsigned int>(bits >> 32));
+#else
+    PackedLine reduced = bits;
+    for (int offset = 16; offset > 0; offset /= 2)
+      reduced |= __shfl_down_sync(0xffffffffu, reduced, offset);
+    low = static_cast<unsigned int>(reduced);
+    high = static_cast<unsigned int>(reduced >> 32);
+#endif
+  } else {
+    low = __ballot_sync(0xffffffffu, a != 0);
+    high = __ballot_sync(0xffffffffu, b != 0);
+  }
+  if (lane == 0)
+    projections[trial * s + x] = (static_cast<PackedLine>(high) << 32) | low;
+}
+
+static __global__ void packed_components(PackedLine* projections, const int* no_change, int s) {
+  const int trial = blockIdx.x;
+  if (no_change[trial] >= 3)
+    return;
+  __shared__ PackedLine reachable[64];
+  const int u = threadIdx.x;
+  const PackedLine self = 1ull << u;
+  if (u < s)
+    reachable[u] = projections[trial * s + u] | self;
+  __syncthreads();
+  // The reflexive pivot row is unchanged in its own Floyd–Warshall step.
+  // Keep it read-only while all other rows read it.
+  for (int pivot = 0; pivot < s; ++pivot) {
+    if (u < s && u != pivot && (reachable[u] & (1ull << pivot)))
+      reachable[u] |= reachable[pivot];
+    __syncthreads();
+  }
+  if (u < s) {
+    PackedLine component = 0;
+    for (PackedLine seen = reachable[u]; seen; seen &= seen - 1) {
+      const int v = __ffsll(seen) - 1;
+      if (reachable[v] & self)
+        component |= 1ull << v;
+    }
+    projections[trial * s + u] = component;
+  }
+}
+
+static __global__ void packed_modify(PackedLine* tdm, const PackedLine* components, int* changed,
+                              const int* no_change, int s, int face, int blocks_per_trial) {
+  const int trial = blockIdx.x / blocks_per_trial;
+  const int block = blockIdx.x % blocks_per_trial;
+  if (no_change[trial] >= 3)
+    return;
+
+  const int cells = s * s;
+  auto* lines = tdm + static_cast<size_t>(trial) * cells;
+  const auto* masks = components + trial * s;
+  bool changed_here = false;
+  for (int xy = block * blockDim.x + threadIdx.x; xy < cells; xy += blockDim.x * blocks_per_trial) {
+    const int x = xy / s;
+    const int y = xy % s;
+    const PackedLine old = lines[xy];
+    PackedLine keep;
+    if (face == 0) {
+      keep = masks[y];
+    } else if (face == 1) {
+      keep = masks[x];
+    } else {
+      keep = (masks[x] & (1ull << y)) ? ~0ull : 0ull;
+    }
+    const PackedLine current = old & keep;
+    if (current != old) {
+      lines[xy] = current;
+      changed_here = true;
+    }
+  }
+  const int changed_block = __syncthreads_or(changed_here);
+  if (threadIdx.x == 0 && changed_block)
+    atomicExch(changed + trial, 1);
+}
+
+static __global__ void sum_packed(const PackedLine* tdm, int* results, int s) {
+  using Reduction = cub::BlockReduce<int, TDM_THREADS>;
+  __shared__ typename Reduction::TempStorage storage;
+  const int trial = blockIdx.x;
+  const int cells = s * s;
+  const auto* lines = tdm + static_cast<size_t>(trial) * cells;
+  int local = 0;
+  for (int xy = threadIdx.x; xy < cells; xy += blockDim.x)
+    local += __popcll(lines[xy]);
+  const int result = Reduction(storage).Sum(local);
+  if (threadIdx.x == 0)
+    results[trial] = result;
+}
+__host__ static void simplify_packed_device(GpuResources& gpu, int s, int k, int trials,
+                                            int modify_blocks, GpuPairCheck pair_check) {
+  auto* tdm = reinterpret_cast<PackedLine*>(gpu.dev_TDM);
+  auto* projection = reinterpret_cast<PackedLine*>(gpu.dev_projection);
+  const uint32_t allow = static_cast<uint32_t>(((1ull << (2 * k)) - 1ull) & 0x55555555ull);
+  switch (pair_check) {
+    case GpuPairCheck::Obvious:
+      build_packed_tdm<GpuPairCheck::Obvious><<<trials, TDM_THREADS, 0, gpu.stream>>>(
+          gpu.dev_Puz, tdm, gpu.dev_pair_failures, s, k, allow);
+      break;
+    case GpuPairCheck::Local:
+      build_packed_tdm<GpuPairCheck::Local><<<trials, TDM_THREADS, 0, gpu.stream>>>(
+          gpu.dev_Puz, tdm, gpu.dev_pair_failures, s, k, allow);
+      break;
+    case GpuPairCheck::Disabled:
+      build_packed_tdm<GpuPairCheck::Disabled><<<trials, TDM_THREADS, 0, gpu.stream>>>(
+          gpu.dev_Puz, tdm, nullptr, s, k, allow);
+      break;
+  }
+
+  const int update_blocks = (trials + TDM_THREADS - 1) / TDM_THREADS;
+  const int max_iter = 3 * s * s;
+  for (int iter = 0; iter < max_iter; ++iter) {
+    const int face = iter % 3;
+    cudaMemsetAsync(gpu.dev_changed, 0, sizeof(int) * trials, gpu.stream);
+    cudaMemsetAsync(gpu.dev_active_count, 0, sizeof(int), gpu.stream);
+    if (face == 0) {
+      packed_project_yz<<<trials, 64, 0, gpu.stream>>>(
+          tdm, projection, gpu.dev_no_change, s);
+    } else {
+      packed_project_x<<<dim3((s + 7) / 8, trials), TDM_THREADS, 0, gpu.stream>>>(
+          tdm, projection, gpu.dev_no_change, s, face);
+    }
+    packed_components<<<trials, 64, 0, gpu.stream>>>(projection, gpu.dev_no_change, s);
+    packed_modify<<<trials * modify_blocks, TDM_THREADS, 0, gpu.stream>>>(
+        tdm, projection, gpu.dev_changed, gpu.dev_no_change, s, face, modify_blocks);
+    update_no_change_Kernel<<<update_blocks, TDM_THREADS, 0, gpu.stream>>>(
+        gpu.dev_changed, gpu.dev_no_change, gpu.dev_active_count, trials);
+
+    int active = 0;
+    auto status = cudaMemcpyAsync(&active, gpu.dev_active_count, sizeof(active),
+                                  cudaMemcpyDeviceToHost, gpu.stream);
+    if (status == cudaSuccess)
+      status = cudaStreamSynchronize(gpu.stream);
+    if (status != cudaSuccess)
+      throw std::runtime_error(cudaGetErrorString(status));
+    if (active == 0)
+      break;
+  }
+  sum_packed<<<trials, TDM_THREADS, 0, gpu.stream>>>(tdm, gpu.dev_result, s);
+}
+
+__host__ static void finish_simplify(GpuResources& gpu, int* results, int trials,
+                                    GpuPairCheck pair_check) {
+  auto status = cudaMemcpyAsync(results, gpu.dev_result, sizeof(int) * trials,
+                                cudaMemcpyDeviceToHost, gpu.stream);
+  if (status == cudaSuccess && pair_check != GpuPairCheck::Disabled) {
+    status = cudaMemcpyAsync(gpu.pair_failures_pinned_buffer, gpu.dev_pair_failures,
+                             sizeof(int) * trials, cudaMemcpyDeviceToHost, gpu.stream);
+  }
+  if (status == cudaSuccess)
+    status = cudaStreamSynchronize(gpu.stream);
+  if (status != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(status));
+  TDM::num_gpu_simplify.fetch_add(static_cast<unsigned long long>(trials),
+                                  std::memory_order_relaxed);
+}
+
 __host__ static void outer_Kernel_impl(GpuResources& gpu_resources, const e_type* puz_pinned_buffer,
                                        int* results_pinned_buffer, int s, int k, int trials,
-                                       bool copy_puzzles_to_device) {
+                                       bool copy_puzzles_to_device, GpuPairCheck pair_check) {
   if (trials <= 0)
     return;
   if (trials > gpu_resources.max_trials) {
@@ -574,7 +887,15 @@ __host__ static void outer_Kernel_impl(GpuResources& gpu_resources, const e_type
   const size_t elements_per_trial = (size_t) s * s * s;
   const size_t total_elements = elements_per_trial * (size_t) trials;
   const size_t puzzle_bytes = sizeof(e_type) * (size_t) s * entries_per_row * (size_t) trials;
-  const size_t result_bytes = sizeof(int) * (size_t) trials;
+  const bool packed = GpuResources::uses_packed_tdm(s, k);
+  const size_t plane = static_cast<size_t>(s) * s;
+  const size_t tdm_bytes = (packed ? plane * sizeof(PackedLine) : elements_per_trial) * trials;
+  const size_t projection_bytes = (packed ? s * sizeof(PackedLine) : plane) * trials;
+  if (puzzle_bytes > gpu_resources.size_Puz || tdm_bytes > gpu_resources.size_TDM ||
+      projection_bytes > gpu_resources.size_projection ||
+      (!packed && sizeof(int) * static_cast<size_t>(s) * trials > gpu_resources.size_ranges)) {
+    throw std::invalid_argument("outer_Kernel dimensions exceed allocated GpuResources buffers.");
+  }
 
   int device_id = gpu_resources.device_id;
   cudaSetDevice(device_id);
@@ -590,6 +911,20 @@ __host__ static void outer_Kernel_impl(GpuResources& gpu_resources, const e_type
   const int default_modify_blocks_per_trial = (s >= 32) ? 4 : 2;
   const int BLOCKS_PER_TRIAL_MOD = std::min(
       16, parse_positive_env_int("ILS_GPU_MOD_BLOCKS_PER_TRIAL", default_modify_blocks_per_trial));
+
+  if (packed) {
+    simplify_packed_device(gpu_resources, s, k, trials, BLOCKS_PER_TRIAL_MOD, pair_check);
+    finish_simplify(gpu_resources, results_pinned_buffer, trials, pair_check);
+    return;
+  }
+
+  if (pair_check == GpuPairCheck::Obvious) {
+    count_pair_failures<GpuPairCheck::Obvious><<<trials, TDM_THREADS, 0, gpu_resources.stream>>>(
+        gpu_resources.dev_Puz, gpu_resources.dev_pair_failures, s, k, entries_per_row);
+  } else if (pair_check == GpuPairCheck::Local) {
+    count_pair_failures<GpuPairCheck::Local><<<trials, TDM_THREADS, 0, gpu_resources.stream>>>(
+        gpu_resources.dev_Puz, gpu_resources.dev_pair_failures, s, k, entries_per_row);
+  }
 
   if ((unsigned) k <= 16u && entries_per_row == 1u) {
     const uint64_t mask =
@@ -690,13 +1025,7 @@ __host__ static void outer_Kernel_impl(GpuResources& gpu_resources, const e_type
       <<<sum_trials_launch * BLOCKS_PER_TRIAL_SUM, TDM_THREADS, 0, gpu_resources.stream>>>(
           gpu_resources.dev_result, gpu_resources.dev_TDM, s, trials, BLOCKS_PER_TRIAL_SUM);
 
-  cudaMemcpyAsync(results_pinned_buffer, gpu_resources.dev_result, result_bytes,
-                  cudaMemcpyDeviceToHost, gpu_resources.stream);
-
-  cudaStreamSynchronize(gpu_resources.stream);
-
-  TDM::num_gpu_simplify.fetch_add(static_cast<unsigned long long>(trials),
-                                  std::memory_order_relaxed);
+  finish_simplify(gpu_resources, results_pinned_buffer, trials, pair_check);
 }
 
 __host__ void outer_Kernel(GpuResources& gpu_resources, int s, int k, int trials) {
@@ -706,10 +1035,11 @@ __host__ void outer_Kernel(GpuResources& gpu_resources, int s, int k, int trials
 
 __host__ void outer_Kernel(GpuResources& gpu_resources, const e_type* puz_pinned_buffer,
                            int* results_pinned_buffer, int s, int k, int trials) {
-  outer_Kernel_impl(gpu_resources, puz_pinned_buffer, results_pinned_buffer, s, k, trials, true);
+  outer_Kernel_impl(gpu_resources, puz_pinned_buffer, results_pinned_buffer, s, k, trials, true,
+                    GpuPairCheck::Disabled);
 }
 
 __host__ void outer_KernelDeviceInput(GpuResources& gpu_resources, int* results_pinned_buffer,
-                                      int s, int k, int trials) {
-  outer_Kernel_impl(gpu_resources, nullptr, results_pinned_buffer, s, k, trials, false);
+                                      int s, int k, int trials, GpuPairCheck pair_check) {
+  outer_Kernel_impl(gpu_resources, nullptr, results_pinned_buffer, s, k, trials, false, pair_check);
 }
